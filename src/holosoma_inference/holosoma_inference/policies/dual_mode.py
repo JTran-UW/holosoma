@@ -17,8 +17,7 @@ def _select_policy_class(config: InferenceConfig):
     ``holosoma.policies.wbt`` (keyed by ``robot_type``) so extensions can
     register custom policy classes without monkey-patching.
     """
-    from importlib.metadata import entry_points
-
+    from holosoma_inference.compat import entry_points
     from holosoma_inference.policies.locomotion import LocomotionPolicy
     from holosoma_inference.policies.wbt import WholeBodyTrackingPolicy
 

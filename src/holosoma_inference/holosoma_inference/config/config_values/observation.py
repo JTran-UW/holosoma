@@ -6,8 +6,7 @@ robot types and tasks, converted from the original YAML configurations.
 
 from __future__ import annotations
 
-from importlib.metadata import entry_points
-
+from holosoma_inference.compat import entry_points
 from holosoma_inference.config.config_types.observation import ObservationConfig
 
 # =============================================================================

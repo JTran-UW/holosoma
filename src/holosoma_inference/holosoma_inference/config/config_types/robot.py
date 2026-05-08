@@ -222,3 +222,15 @@ class RobotConfig:
 
     num_upper_body_joints: int = 14
     """Number of upper body degrees of freedom."""
+
+    # =========================================================================
+    # Per-Robot Calibration
+    # =========================================================================
+
+    joint_offsets_deg: tuple[float, ...] | None = None
+    """Per-joint offsets in degrees applied to lowcmd (action-space only).
+
+    These offsets correct for per-robot motor calibration differences without
+    affecting the observation/state space. Converted to radians at init time.
+    Length must equal num_joints when provided.
+    """

@@ -49,6 +49,8 @@ setup(
         "zmq",
         "defusedxml",
         "evdev",
+        "importlib_metadata>=4.6; python_version<'3.12'",
+        "eval_type_backport; python_version<'3.10'",
     ],
     extras_require={
         "dev": [

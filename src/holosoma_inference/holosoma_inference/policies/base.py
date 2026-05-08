@@ -73,6 +73,11 @@ class BasePolicy:
         self.num_dofs = self.robot_config.num_joints
         self.default_dof_angles = np.array(self.robot_config.default_dof_angles)
         self.num_upper_dofs = robot_config.num_upper_body_joints
+
+        # Per-robot joint offsets (action-space calibration, does not affect observations)
+        offsets_deg = robot_config.joint_offsets_deg
+        self.joint_offsets = np.deg2rad(offsets_deg) if offsets_deg is not None else np.zeros(self.num_dofs)
+
         # Setup dof names and indices
         self._setup_dof_mappings()
 
@@ -690,7 +695,7 @@ class BasePolicy:
                 q_target = scaled_policy_action + self.default_dof_angles
 
             # Prepare command (reuse pre-allocated arrays)
-            self.cmd_q[:] = q_target
+            self.cmd_q[:] = q_target[0] + self.joint_offsets
 
         # Stage 5: Action Pub
         with self.latency_tracker.measure("action_pub"):
