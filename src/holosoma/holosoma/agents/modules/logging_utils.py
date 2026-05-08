@@ -94,6 +94,9 @@ class LoggingHelper:
         self.is_main_process: bool = is_main_process
         self.num_gpus: int = num_gpus
 
+        self.ep_string = ""
+        self.ep_scalars_to_log = {}
+
         # Book keeping
         self.ep_infos: list[dict[str, Any]] = []
         self.raw_ep_infos: list[dict[str, Any]] = []
@@ -183,7 +186,7 @@ class LoggingHelper:
         iteration_time = self.collection_time + self.learn_time
 
         # Log episode info
-        ep_string, ep_scalars_to_log = self._log_episode_info()
+        ep_string, ep_scalars_to_log = self.ep_string, self.ep_scalars_to_log # self._log_episode_info()
 
         env_log_dict = self.episode_env_tensors.mean_and_clear()
         env_log_dict = {f"Env/{k}": v for k, v in env_log_dict.items()}
@@ -245,9 +248,11 @@ class LoggingHelper:
 
         # Process regular episode info
         if self.ep_infos:
-            for key in self.ep_infos[0]:
+            for key in self.ep_infos[-1]:
                 infotensor = torch.tensor([], device=self.device)
                 for ep_info in self.ep_infos:
+                    if ep_info == {}:
+                        continue
                     if not isinstance(ep_info[key], torch.Tensor):
                         ep_info[key] = torch.Tensor([ep_info[key]])
                     if len(ep_info[key].shape) == 0:
@@ -275,6 +280,8 @@ class LoggingHelper:
                 scalars_to_log[f"RawEpisode/{key}"] = value
                 ep_string += f"""{f"Mean raw episode {key}:":>35} {value:.4f}\n"""
 
+        self.ep_string = ep_string
+        self.ep_scalars_to_log = scalars_to_log
         return ep_string, scalars_to_log
 
     def _logging_to_writer(

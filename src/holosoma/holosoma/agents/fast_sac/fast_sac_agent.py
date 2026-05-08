@@ -158,7 +158,7 @@ class FastSACAgent(BaseAlgo):
     qnet: Critic
 
     def __init__(
-        self, env: BaseTask, config: FastSACConfig, device: str, log_dir: str, multi_gpu_cfg: dict | None = None
+        self, env: BaseTask, config: FastSACConfig, device: str, log_dir: str, multi_gpu_cfg: dict | None = None, expert_policy=None, expert_critic=None, lambda_bc_policy=0.0, lambda_bc_critic=0.0
     ):
         wrapped_env = FastSACEnv(env, config.actor_obs_keys, config.critic_obs_keys)
 
@@ -180,6 +180,11 @@ class FastSACAgent(BaseAlgo):
 
         self.training_metrics = TensorAverageMeterDict()
         self.eval_callbacks: list[RLEvalCallback] = []
+        self.expert_policy = expert_policy
+        self.expert_critic = expert_critic
+        self.lambda_bc_policy = lambda_bc_policy
+        self.lambda_bc_critic = lambda_bc_critic
+        self.expert_ratio: float = 0.5
 
     def setup(self) -> None:
         logger.info("Setting up FastSAC")
@@ -346,6 +351,7 @@ class FastSACAgent(BaseAlgo):
             gamma=args.gamma,
             device=device,
         )
+        self.expert_rb: SimpleReplayBuffer | None = None
 
         if args.use_symmetry:
             # using env._env is not really ideal..
@@ -415,8 +421,10 @@ class FastSACAgent(BaseAlgo):
 
         with self._maybe_amp():
             next_observations = data["next"]["observations"]
+            unnormed_next_observations = data["next"]["unnormed_observations"]
             critic_observations = data["critic_observations"]
             next_critic_observations = data["next"]["critic_observations"]
+            unnormed_next_critic_observations = data["next"]["unnormed_critic_observations"]
             actions = data["actions"]
             rewards = data["next"]["rewards"]
             dones = data["next"]["dones"].bool()
@@ -424,6 +432,10 @@ class FastSACAgent(BaseAlgo):
             bootstrap = (truncations | ~dones).float()
 
             with torch.no_grad():
+                # if self.expert_policy is not None:
+                #     next_state_actions = self.expert_policy(unnormed_next_observations)
+                #     _, next_state_log_probs = actor.get_actions_and_log_probs(next_observations)
+                # else:
                 next_state_actions, next_state_log_probs = actor.get_actions_and_log_probs(next_observations)
                 discount = args.gamma ** data["next"]["effective_n_steps"]
 
@@ -442,6 +454,35 @@ class FastSACAgent(BaseAlgo):
             critic_log_probs = F.log_softmax(q_outputs, dim=-1)
             critic_losses = -torch.sum(target_distributions * critic_log_probs, dim=-1)
             qf_loss = critic_losses.mean(dim=1).sum(dim=0)
+
+            bc_critic_loss = torch.tensor(0.0, device=self.device)
+            if self.expert_critic is not None: #  and self.lambda_bc_critic > 0:
+                with torch.no_grad():
+                    expert_v_next = self.expert_critic(unnormed_next_critic_observations)  # [batch]
+                    expert_target = rewards + discount * bootstrap * expert_v_next  # [batch]
+                    # Project expert_target scalar onto atom support as a point distribution
+                    batch_size = expert_target.shape[0]
+                    num_atoms = qnet.num_atoms
+                    delta_z = (qnet.v_max - qnet.v_min) / (num_atoms - 1)
+                    t = expert_target.clamp(qnet.v_min, qnet.v_max)
+                    b = (t - qnet.v_min) / delta_z  # [batch]
+                    lower = torch.floor(b).long()
+                    upper = torch.ceil(b).long()
+                    # Edge case: b is exactly an integer — ensure lower != upper
+                    is_integer = upper == lower
+                    lower_mask = is_integer & (lower > 0)
+                    upper_mask = is_integer & (lower == 0)
+                    lower = torch.where(lower_mask, lower - 1, lower)
+                    upper = torch.where(upper_mask, upper + 1, upper)
+                    # Build point distribution [batch, num_atoms]
+                    point_dist = torch.zeros(batch_size, num_atoms, device=self.device)
+                    batch_idx = torch.arange(batch_size, device=self.device)
+                    point_dist[batch_idx, lower] = upper.float() - b
+                    point_dist[batch_idx, upper] = b - lower.float()
+                # Cross-entropy against point distribution; q_outputs: [num_critics, batch, num_atoms]
+                log_probs = F.log_softmax(q_outputs, dim=-1)  # [num_critics, batch, num_atoms]
+                bc_critic_loss = -(point_dist.unsqueeze(0) * log_probs).sum(-1).mean() * self.lambda_bc_critic
+                qf_loss += bc_critic_loss
 
         q_optimizer.zero_grad(set_to_none=True)
         scaler.scale(qf_loss).backward()
@@ -484,6 +525,7 @@ class FastSACAgent(BaseAlgo):
             target_value_max.detach(),
             target_value_min.detach(),
             alpha_loss.detach(),
+            bc_critic_loss.detach(),
         )
 
     def _update_pol(self, data: TensorDict) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -497,11 +539,10 @@ class FastSACAgent(BaseAlgo):
             critic_observations = data["critic_observations"]
 
             actions, log_probs = actor.get_actions_and_log_probs(data["observations"])
-            # For logging, this is a bit wasteful though, but could be useful
+            _, mean, log_std = actor(data["observations"])
+            std = log_std.exp()
             with torch.no_grad():
-                _, _, log_std = actor(data["observations"])
-                action_std = log_std.exp().mean()
-                # Compute policy entropy (negative log probability)
+                action_std = std.mean()
                 policy_entropy = -log_probs.mean()
 
             q_outputs = qnet(critic_observations, actions)
@@ -509,6 +550,15 @@ class FastSACAgent(BaseAlgo):
             q_values = qnet.get_value(q_probs)
             qf_value = q_values.mean(dim=0)
             actor_loss = (self.log_alpha.exp().detach() * log_probs - qf_value).mean()
+
+            bc_policy_loss = torch.tensor(0.0, device=self.device)
+            if self.expert_policy is not None:
+                with torch.no_grad():
+                    expert_mean, expert_std = self.expert_policy(data["unnormed_observations"])
+                expert_dist = torch.distributions.Normal(expert_mean, expert_std)
+                current_dist = torch.distributions.Normal(mean, std)
+                bc_policy_loss = torch.distributions.kl_divergence(expert_dist, current_dist).sum(-1).mean() * self.lambda_bc_policy
+                actor_loss += bc_policy_loss
 
         actor_optimizer.zero_grad(set_to_none=True)
         scaler.scale(actor_loss).backward()
@@ -532,6 +582,7 @@ class FastSACAgent(BaseAlgo):
             actor_loss.detach(),
             policy_entropy.detach(),
             action_std.detach(),
+            bc_policy_loss.detach(),
         )
 
     def _sample_and_prepare_batches(
@@ -543,8 +594,25 @@ class FastSACAgent(BaseAlgo):
         """
         # Sample a large batch (batch_size * num_updates)
         large_batch_size = batch_size * num_updates
-        large_data = self.rb.sample(large_batch_size)
-        samples_per_update = batch_size * self.env.num_envs
+
+        if self.expert_rb is not None:
+            # Mix expert/online per update using self.expert_ratio.
+            # Expert rb may have a different n_env from the online env, so we
+            # compute a per-env count that lands at ~expert_ratio of total samples.
+            main_per_env = max(round(batch_size * (1.0 - self.expert_ratio)), 1)
+            target_expert_total_per_update = (batch_size - main_per_env) * self.env.num_envs
+            expert_per_env = max(target_expert_total_per_update // self.expert_rb.n_env, 1)
+
+            per_update_batches = []
+            for _ in range(num_updates):
+                main_data = self.rb.sample(main_per_env)
+                expert_data = self.expert_rb.sample(expert_per_env)
+                per_update_batches.append(torch.cat([main_data, expert_data], dim=0))
+            large_data = torch.cat(per_update_batches, dim=0)
+            samples_per_update = large_data["actions"].shape[0] // num_updates
+        else:
+            large_data = self.rb.sample(large_batch_size)
+            samples_per_update = batch_size * self.env.num_envs
 
         if self.config.use_symmetry:
             samples_per_update *= 2
@@ -589,8 +657,12 @@ class FastSACAgent(BaseAlgo):
             large_data = augmented_large_data
 
         # Normalize all data once
+        large_data["unnormed_observations"] = large_data["observations"]
+        large_data["next"]["unnormed_observations"] = large_data["next"]["observations"]
         large_data["observations"] = normalize_obs(large_data["observations"])
         large_data["next"]["observations"] = normalize_obs(large_data["next"]["observations"])
+        large_data["unnormed_critic_observations"] = large_data["critic_observations"]
+        large_data["next"]["unnormed_critic_observations"] = large_data["next"]["critic_observations"]
         large_data["critic_observations"] = normalize_critic_obs(large_data["critic_observations"])
         large_data["next"]["critic_observations"] = normalize_critic_obs(large_data["next"]["critic_observations"])
 
@@ -605,19 +677,23 @@ class FastSACAgent(BaseAlgo):
             batch_data = TensorDict(
                 {
                     "observations": large_data["observations"][start_idx:end_idx],
+                    "unnormed_observations": large_data["unnormed_observations"][start_idx:end_idx],
                     "actions": large_data["actions"][start_idx:end_idx],
                     "next": {
                         "rewards": large_data["next"]["rewards"][start_idx:end_idx],
                         "dones": large_data["next"]["dones"][start_idx:end_idx],
                         "truncations": large_data["next"]["truncations"][start_idx:end_idx],
+                        "unnormed_observations": large_data["next"]["unnormed_observations"][start_idx:end_idx],
                         "observations": large_data["next"]["observations"][start_idx:end_idx],
                         "effective_n_steps": large_data["next"]["effective_n_steps"][start_idx:end_idx],
                     },
                     "critic_observations": large_data["critic_observations"][start_idx:end_idx],
+                    "unnormed_critic_observations": large_data["unnormed_critic_observations"][start_idx:end_idx],
                 },
                 batch_size=samples_per_update,
             )
             batch_data["next"]["critic_observations"] = large_data["next"]["critic_observations"][start_idx:end_idx]
+            batch_data["next"]["unnormed_critic_observations"] = large_data["next"]["unnormed_critic_observations"][start_idx:end_idx]
 
             prepared_batches.append(batch_data)
 
@@ -646,6 +722,60 @@ class FastSACAgent(BaseAlgo):
         self.scaler.load_state_dict(torch_checkpoint["grad_scaler_state_dict"])
         self.global_step = torch_checkpoint["global_step"]
         self._restore_env_state(torch_checkpoint.get("env_state"))
+
+    def load_expert_replay_buffer(self, path: str | None) -> None:
+        """Load an expert replay buffer saved by the UWLab play.py recorder.
+
+        Expected payload layout (see ``record_transitions_to_replay_buffer``):
+            {"buffer_tensors": {observations, actions, rewards, dones, truncations,
+                                next_observations, critic_observations,
+                                next_critic_observations, ptr},
+             "metadata": {n_env, buffer_size, n_obs, n_act, n_critic_obs, ...}}
+        """
+        if not path:
+            return
+
+        payload = torch.load(path, map_location=self.device, weights_only=False)
+        tensors = payload["buffer_tensors"]
+        meta = payload["metadata"]
+
+        # Shape check against main rb dims to catch obvious mismatches early.
+        if meta["n_obs"] != self.rb.n_obs or meta["n_act"] != self.rb.n_act:
+            raise ValueError(
+                f"Expert buffer dims (n_obs={meta['n_obs']}, n_act={meta['n_act']}) "
+                f"do not match agent dims (n_obs={self.rb.n_obs}, n_act={self.rb.n_act})."
+            )
+        if meta["n_critic_obs"] != self.rb.n_critic_obs:
+            raise ValueError(
+                f"Expert buffer n_critic_obs={meta['n_critic_obs']} does not match "
+                f"agent n_critic_obs={self.rb.n_critic_obs}."
+            )
+
+        expert_rb = SimpleReplayBuffer(
+            n_env=meta["n_env"],
+            buffer_size=meta["buffer_size"],
+            n_obs=meta["n_obs"],
+            n_act=meta["n_act"],
+            n_critic_obs=meta["n_critic_obs"],
+            n_steps=1,
+            gamma=self.config.gamma,
+            device=self.device,
+        )
+        expert_rb.observations.copy_(tensors["observations"].to(self.device))
+        expert_rb.actions.copy_(tensors["actions"].to(self.device))
+        expert_rb.rewards.copy_(tensors["rewards"].to(self.device))
+        expert_rb.dones.copy_(tensors["dones"].to(self.device))
+        expert_rb.truncations.copy_(tensors["truncations"].to(self.device))
+        expert_rb.next_observations.copy_(tensors["next_observations"].to(self.device))
+        expert_rb.critic_observations.copy_(tensors["critic_observations"].to(self.device))
+        expert_rb.next_critic_observations.copy_(tensors["next_critic_observations"].to(self.device))
+        expert_rb.ptr = int(tensors["ptr"])
+
+        self.expert_rb = expert_rb
+        logger.info(
+            f"Loaded expert replay buffer from {path}: "
+            f"n_env={meta['n_env']}, buffer_size={meta['buffer_size']}, ptr={expert_rb.ptr}"
+        )
 
     def learn(self) -> None:
         args = self.config
@@ -676,6 +806,7 @@ class FastSACAgent(BaseAlgo):
         action_std = torch.tensor(0.0, device=device)
         actor_loss = torch.tensor(0.0, device=device)
         actor_grad_norm = torch.tensor(0.0, device=device)
+        bc_policy_loss = torch.tensor(0.0, device=device)
         pbar = tqdm.tqdm(total=args.num_learning_iterations, initial=self.global_step)
 
         while self.global_step <= args.num_learning_iterations:
@@ -728,6 +859,8 @@ class FastSACAgent(BaseAlgo):
                 rb.extend(transition)
 
             # NOTE: args.batch_size is the global batch size
+            if len(self.logging_helper.ep_infos) > 0 and self.logging_helper.ep_infos[-1] != {}:
+                self.logging_helper._log_episode_info()
             batch_size = max(args.batch_size // env.num_envs // self.gpu_world_size, 1)
             if self.global_step > args.learning_starts:
                 with self.logging_helper.record_learn_time():
@@ -744,12 +877,20 @@ class FastSACAgent(BaseAlgo):
                             qf_max,
                             qf_min,
                             alpha_loss,
+                            bc_critic_loss,
                         ) = update_main(data)
+                        if self.expert_critic is not None:
+                            self.lambda_bc_critic *= 0.999
+
                         if args.num_updates > 1:
                             if i % args.policy_frequency == 1:
-                                actor_grad_norm, actor_loss, policy_entropy, action_std = update_pol(data)
+                                actor_grad_norm, actor_loss, policy_entropy, action_std, bc_policy_loss = update_pol(data)
+                                if self.expert_policy is not None:
+                                    self.lambda_bc_policy *= 0.999
                         elif self.global_step % args.policy_frequency == 0:
-                            actor_grad_norm, actor_loss, policy_entropy, action_std = update_pol(data)
+                            actor_grad_norm, actor_loss, policy_entropy, action_std, bc_policy_loss = update_pol(data)
+                            if self.expert_policy is not None:
+                                self.lambda_bc_policy *= 0.999
 
                         # Accumulate training metrics for smoother logging
                         current_metrics = {
@@ -764,6 +905,10 @@ class FastSACAgent(BaseAlgo):
                             "alpha_value": self.log_alpha.exp().detach().mean(),
                             "policy_entropy": policy_entropy,
                             "action_std": action_std,
+                            "bc_policy_loss": bc_policy_loss,
+                            "bc_critic_loss": bc_critic_loss,
+                            "expert_policy_active": torch.tensor(float(self.expert_policy is not None), device=self.device),
+                            "expert_critic_active": torch.tensor(float(self.expert_critic is not None), device=self.device),
                         }
                         self.training_metrics.add(current_metrics)
 
@@ -772,7 +917,10 @@ class FastSACAgent(BaseAlgo):
                             tgt_ps = [p.data for p in qnet_target.parameters()]
                             torch._foreach_mul_(tgt_ps, 1.0 - args.tau)
                             torch._foreach_add_(tgt_ps, src_ps, alpha=args.tau)
-
+                
+                # if self.global_step == 20000:
+                #     self.expert_rb = None
+            
                 if self.global_step % args.logging_interval == 0:
                     with torch.no_grad():
                         # Use accumulated training metrics for smoother logging (reduces noise)
@@ -788,6 +936,9 @@ class FastSACAgent(BaseAlgo):
 
                         # Add current env rewards (not part of training loop accumulation)
                         loss_dict["env_rewards"] = rewards.mean().item()
+                        print(f"lambda_bc_critic in learn: {self.lambda_bc_critic}")
+                        loss_dict["lambda_bc_critic"] = self.lambda_bc_critic
+                        loss_dict["lambda_bc_policy"] = self.lambda_bc_policy
 
                     # Use logging helper
                     self.logging_helper.post_epoch_logging(it=self.global_step, loss_dict=loss_dict, extra_log_dicts={})
@@ -795,7 +946,7 @@ class FastSACAgent(BaseAlgo):
                     if self.is_main_process:
                         logger.info(f"Saving model at global step {self.global_step}")
                         self.save(os.path.join(self.log_dir, f"model_{self.global_step:07d}.pt"))
-                        self.export(onnx_file_path=os.path.join(self.log_dir, f"model_{self.global_step:07d}.onnx"))
+                        # self.export(onnx_file_path=os.path.join(self.log_dir, f"model_{self.global_step:07d}.onnx"))
 
             # Avoid global_step being incremented beyond args.num_learning_iterations, so that the final checkpoint is
             # saved at exactly args.num_learning_iterations. In the `while` condition, we check for self.global_step <=
@@ -808,7 +959,7 @@ class FastSACAgent(BaseAlgo):
 
         if self.is_main_process:
             self.save(os.path.join(self.log_dir, f"model_{self.global_step:07d}.pt"))
-            self.export(onnx_file_path=os.path.join(self.log_dir, f"model_{self.global_step:07d}.onnx"))
+            # self.export(onnx_file_path=os.path.join(self.log_dir, f"model_{self.global_step:07d}.onnx"))
 
     def save(self, path: str) -> None:  # type: ignore[override]
         env_state = self._collect_env_state()
@@ -841,6 +992,24 @@ class FastSACAgent(BaseAlgo):
             "actor_obs": torch.cat([obs_dict[k] for k in self.config.actor_obs_keys], dim=1),
             "critic_obs": torch.cat([obs_dict[k] for k in self.config.critic_obs_keys], dim=1),
         }
+
+    def get_inference_critic(self, device: str | None = None) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
+        device = device or self.device
+        qnet = self.qnet.to(device)
+        critic_obs_normalizer = self.critic_obs_normalizer.to(device)
+        qnet.eval()
+        critic_obs_normalizer.eval()
+
+        def critic_fn(critic_obs: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+            if self.obs_normalization:
+                normalized_obs = critic_obs_normalizer(critic_obs, update=False)
+            else:
+                normalized_obs = critic_obs
+            q_outputs = qnet(normalized_obs, actions)  # [num_critics, batch, num_atoms]
+            q_values = qnet.get_value(F.softmax(q_outputs, dim=-1))  # [num_critics, batch]
+            return q_values.mean(dim=0)  # [batch]
+
+        return critic_fn
 
     def get_inference_policy(self, device: str | None = None) -> Callable[[dict[str, torch.Tensor]], torch.Tensor]:
         device = device or self.device

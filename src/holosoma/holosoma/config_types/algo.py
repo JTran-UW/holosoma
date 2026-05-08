@@ -266,7 +266,7 @@ class FastSACConfig:
     log_std_min: float = -5.0
     """the minimum value of the log std"""
 
-    compile: bool = True
+    compile: bool = False
     """whether to use torch.compile."""
 
     obs_normalization: bool = True
