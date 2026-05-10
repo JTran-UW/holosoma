@@ -185,6 +185,13 @@ class FastSACAgent(BaseAlgo):
         self.lambda_bc_policy = lambda_bc_policy
         self.lambda_bc_critic = lambda_bc_critic
         self.expert_ratio: float = 0.5
+        self.expert_ratio_anneal_steps: int = 0  # 0 = no annealing
+
+    @property
+    def _current_expert_ratio(self) -> float:
+        if self.expert_ratio_anneal_steps <= 0:
+            return self.expert_ratio
+        return self.expert_ratio * max(0.0, 1.0 - self.global_step / self.expert_ratio_anneal_steps)
 
     def setup(self) -> None:
         logger.info("Setting up FastSAC")
@@ -596,10 +603,10 @@ class FastSACAgent(BaseAlgo):
         large_batch_size = batch_size * num_updates
 
         if self.expert_rb is not None:
-            # Mix expert/online per update using self.expert_ratio.
+            # Mix expert/online per update using self.expert_ratio (linearly annealed if configured).
             # Expert rb may have a different n_env from the online env, so we
             # compute a per-env count that lands at ~expert_ratio of total samples.
-            main_per_env = max(round(batch_size * (1.0 - self.expert_ratio)), 1)
+            main_per_env = max(round(batch_size * (1.0 - self._current_expert_ratio)), 1)
             target_expert_total_per_update = (batch_size - main_per_env) * self.env.num_envs
             expert_per_env = max(target_expert_total_per_update // self.expert_rb.n_env, 1)
 
@@ -939,6 +946,7 @@ class FastSACAgent(BaseAlgo):
                         print(f"lambda_bc_critic in learn: {self.lambda_bc_critic}")
                         loss_dict["lambda_bc_critic"] = self.lambda_bc_critic
                         loss_dict["lambda_bc_policy"] = self.lambda_bc_policy
+                        loss_dict["expert_ratio"] = self._current_expert_ratio
 
                     # Use logging helper
                     self.logging_helper.post_epoch_logging(it=self.global_step, loss_dict=loss_dict, extra_log_dicts={})
