@@ -105,6 +105,8 @@ class LoggingHelper:
         self.cur_reward_sum: torch.Tensor = torch.zeros(num_envs, dtype=torch.float, device=self.device)
         self.cur_episode_length: torch.Tensor = torch.zeros(num_envs, dtype=torch.float, device=self.device)
         self.episode_env_tensors: TensorAverageMeterDict = TensorAverageMeterDict()
+        # Total number of completed episodes across all envs since training started.
+        self.total_episodes: int = 0
 
     @contextmanager
     def record_collection_time(self) -> Generator[None, None, None]:
@@ -147,6 +149,7 @@ class LoggingHelper:
             self.lenbuffer.extend(self.cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
             self.cur_reward_sum[new_ids] = 0
             self.cur_episode_length[new_ids] = 0
+            self.total_episodes += len(new_ids)
 
         # Update episode environment tensors
         self.episode_env_tensors.add(infos["to_log"])
@@ -339,6 +342,7 @@ class LoggingHelper:
             scalars_to_log["Train/mean_episode_length/time"] = statistics.mean(self.lenbuffer)
 
         scalars_to_log["Train/num_samples"] = self.tot_timesteps
+        scalars_to_log["Train/total_episodes"] = self.total_episodes
 
         # Add prefix to all keys
         scalars_to_log = {f"{self.prefix}{k}": v for k, v in scalars_to_log.items()}

@@ -436,13 +436,13 @@ class FastSACAgent(BaseAlgo):
             rewards = data["next"]["rewards"]
             dones = data["next"]["dones"].bool()
             truncations = data["next"]["truncations"].bool()
-            bootstrap = (truncations | ~dones).float()
+
+            # NOTE: We are switching to bootstrap=true if all dones are false (including truncation)
+            # This is because timeout/truncation IS terminal in reaching/peg-insertion MDP
+            # bootstrap = (truncations | ~dones).float()
+            bootstrap = (~dones).float()
 
             with torch.no_grad():
-                # if self.expert_policy is not None:
-                #     next_state_actions = self.expert_policy(unnormed_next_observations)
-                #     _, next_state_log_probs = actor.get_actions_and_log_probs(next_observations)
-                # else:
                 next_state_actions, next_state_log_probs = actor.get_actions_and_log_probs(next_observations)
                 discount = args.gamma ** data["next"]["effective_n_steps"]
 
@@ -784,21 +784,61 @@ class FastSACAgent(BaseAlgo):
             f"n_env={meta['n_env']}, buffer_size={meta['buffer_size']}, ptr={expert_rb.ptr}"
         )
 
+    def save_replay_buffer(self, path: str) -> None:
+        """Save the online replay buffer to disk for later resumption."""
+        rb = self.rb
+        payload = {
+            "observations": rb.observations.cpu(),
+            "actions": rb.actions.cpu(),
+            "rewards": rb.rewards.cpu(),
+            "dones": rb.dones.cpu(),
+            "truncations": rb.truncations.cpu(),
+            "next_observations": rb.next_observations.cpu(),
+            "critic_observations": rb.critic_observations.cpu(),
+            "next_critic_observations": rb.next_critic_observations.cpu(),
+            "ptr": rb.ptr,
+            "n_env": rb.n_env,
+            "buffer_size": rb.buffer_size,
+            "global_step": self.global_step,
+        }
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        torch.save(payload, path)
+        logger.info(f"Saved replay buffer ({rb.n_env * rb.buffer_size} transitions) to {path}")
+
+    def load_replay_buffer(self, path: str) -> None:
+        """Restore a previously saved online replay buffer."""
+        payload = torch.load(path, map_location=self.device, weights_only=False)
+        rb = self.rb
+        rb.observations.copy_(payload["observations"].to(self.device))
+        rb.actions.copy_(payload["actions"].to(self.device))
+        rb.rewards.copy_(payload["rewards"].to(self.device))
+        rb.dones.copy_(payload["dones"].to(self.device))
+        rb.truncations.copy_(payload["truncations"].to(self.device))
+        rb.next_observations.copy_(payload["next_observations"].to(self.device))
+        rb.critic_observations.copy_(payload["critic_observations"].to(self.device))
+        rb.next_critic_observations.copy_(payload["next_critic_observations"].to(self.device))
+        rb.ptr = payload["ptr"]
+        logger.info(
+            f"Loaded replay buffer from {path}: "
+            f"n_env={payload['n_env']}, buffer_size={payload['buffer_size']}, ptr={rb.ptr}, "
+            f"saved at global_step={payload.get('global_step', 'unknown')}"
+        )
+
     def learn(self) -> None:
         args = self.config
         device = self.device
-        if args.compile:
-            update_main = torch.compile(self._update_main)
-            update_pol = torch.compile(self._update_pol)
-            policy = torch.compile(self.policy)
-            normalize_obs = torch.compile(self.obs_normalizer.forward)
-            normalize_critic_obs = torch.compile(self.critic_obs_normalizer.forward)
-        else:
-            update_main = self._update_main
-            update_pol = self._update_pol
-            policy = self.policy
-            normalize_obs = self.obs_normalizer.forward
-            normalize_critic_obs = self.critic_obs_normalizer.forward
+        # if args.compile:
+        #     update_main = torch.compile(self._update_main)
+        #     update_pol = torch.compile(self._update_pol)
+        #     policy = torch.compile(self.policy)
+        #     normalize_obs = torch.compile(self.obs_normalizer.forward)
+        #     normalize_critic_obs = torch.compile(self.critic_obs_normalizer.forward)
+        # else:
+        update_main = self._update_main
+        update_pol = self._update_pol
+        policy = self.policy
+        normalize_obs = self.obs_normalizer.forward
+        normalize_critic_obs = self.critic_obs_normalizer.forward
         qnet = self.qnet
         qnet_target = self.qnet_target
         env = self.env
@@ -815,6 +855,11 @@ class FastSACAgent(BaseAlgo):
         actor_grad_norm = torch.tensor(0.0, device=device)
         bc_policy_loss = torch.tensor(0.0, device=device)
         pbar = tqdm.tqdm(total=args.num_learning_iterations, initial=self.global_step)
+    
+        if args.num_updates < 1:
+            num_updates = 1
+        else:
+            num_updates = int(args.num_updates)
 
         while self.global_step <= args.num_learning_iterations:
             # Synchronize curriculum metrics across GPUs before rollout
@@ -871,9 +916,14 @@ class FastSACAgent(BaseAlgo):
             batch_size = max(args.batch_size // env.num_envs // self.gpu_world_size, 1)
             if self.global_step > args.learning_starts:
                 with self.logging_helper.record_learn_time():
+                    if args.num_updates < 1 and self.global_step % int(1 / args.num_updates) != 0:
+                        self.global_step += 1
+                        pbar.update(1)
+                        continue
+
                     # Use batched sampling: sample once, normalize once, split into updates
                     prepared_batches = self._sample_and_prepare_batches(
-                        batch_size, args.num_updates, normalize_obs, normalize_critic_obs
+                        batch_size, num_updates, normalize_obs, normalize_critic_obs
                     )
                     for i, data in enumerate(prepared_batches):
                         # Data is already normalized, just run the updates
@@ -889,12 +939,12 @@ class FastSACAgent(BaseAlgo):
                         if self.expert_critic is not None:
                             self.lambda_bc_critic *= 0.999
 
-                        if args.num_updates > 1:
+                        if num_updates > 1:
                             if i % args.policy_frequency == 1:
                                 actor_grad_norm, actor_loss, policy_entropy, action_std, bc_policy_loss = update_pol(data)
                                 if self.expert_policy is not None:
                                     self.lambda_bc_policy *= 0.999
-                        elif self.global_step % args.policy_frequency == 0:
+                        elif self.global_step % (args.policy_frequency * int(1 / args.num_updates)) == 0:
                             actor_grad_norm, actor_loss, policy_entropy, action_std, bc_policy_loss = update_pol(data)
                             if self.expert_policy is not None:
                                 self.lambda_bc_policy *= 0.999
@@ -954,6 +1004,11 @@ class FastSACAgent(BaseAlgo):
                     if self.is_main_process:
                         logger.info(f"Saving model at global step {self.global_step}")
                         self.save(os.path.join(self.log_dir, f"model_{self.global_step:07d}.pt"))
+                if args.save_replay_buffer_interval > 0 and self.global_step > 0 and self.global_step % args.save_replay_buffer_interval == 0:
+                    if self.is_main_process:
+                        rb_path = os.path.join(self.log_dir, f"replay_buffer_{self.global_step:07d}.pt")
+                        logger.info(f"Saving replay buffer at global step {self.global_step}")
+                        self.save_replay_buffer(rb_path)
                         # self.export(onnx_file_path=os.path.join(self.log_dir, f"model_{self.global_step:07d}.onnx"))
 
             # Avoid global_step being incremented beyond args.num_learning_iterations, so that the final checkpoint is

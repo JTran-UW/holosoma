@@ -293,6 +293,9 @@ class FastSACConfig:
     save_interval: int = 1000
     """the interval to save the model"""
 
+    save_replay_buffer_interval: int = 0
+    """save the online replay buffer every N global steps. 0 = disabled."""
+
     logging_interval: int = 100
     """the interval to log the metrics"""
 
