@@ -4,6 +4,8 @@ import copy
 import itertools
 import math
 import os
+import statistics
+import time
 from contextlib import contextmanager
 from typing import Any, Callable, Dict, Sequence
 
@@ -35,13 +37,15 @@ from holosoma.utils.inference_helpers import (
 from holosoma.utils.safe_torch_import import (
     F,
     GradScaler,
-    TensorboardSummaryWriter,
     TensorDict,
     autocast,
     nn,
     optim,
     torch,
 )
+
+from torch.utils.tensorboard import SummaryWriter
+from collections import deque
 
 torch.set_float32_matmul_precision("high")
 
@@ -100,6 +104,7 @@ class FastSACEnv:
             "raw_episode": info_dict.get("raw_episode", {}),
             "raw_episode_all": info_dict.get("raw_episode_all", {}),
             "to_log": info_dict["to_log"],
+            "ep_success": info_dict["ep_success"]
         }
         return actor_obs, rew_buf, reset_buf, extras
 
@@ -166,17 +171,7 @@ class FastSACAgent(BaseAlgo):
         self.unwrapped_env = env
         self.log_dir = log_dir
         self.global_step = 0
-        self.writer = TensorboardSummaryWriter(log_dir=self.log_dir, flush_secs=10)
-        self.logging_helper = LoggingHelper(
-            self.writer,
-            self.log_dir,
-            device=self.device,
-            num_envs=self.env.num_envs,
-            num_steps_per_env=config.logging_interval,
-            num_learning_iterations=config.num_learning_iterations,
-            is_main_process=self.is_main_process,
-            num_gpus=self.gpu_world_size,
-        )
+        self.writer = SummaryWriter(log_dir=log_dir)
 
         self.training_metrics = TensorAverageMeterDict()
         self.eval_callbacks: list[RLEvalCallback] = []
@@ -458,6 +453,7 @@ class FastSACAgent(BaseAlgo):
                 target_value_min = target_values.min()
 
             q_outputs = qnet(critic_observations, actions)
+            q_values = qnet.get_value(F.softmax(q_outputs, dim=-1))
             critic_log_probs = F.log_softmax(q_outputs, dim=-1)
             critic_losses = -torch.sum(target_distributions * critic_log_probs, dim=-1)
             qf_loss = critic_losses.mean(dim=1).sum(dim=0)
@@ -529,6 +525,7 @@ class FastSACAgent(BaseAlgo):
             rewards.mean(),
             critic_grad_norm.detach(),
             qf_loss.detach(),
+            q_values.detach(),
             target_value_max.detach(),
             target_value_min.detach(),
             alpha_loss.detach(),
@@ -827,22 +824,23 @@ class FastSACAgent(BaseAlgo):
     def learn(self) -> None:
         args = self.config
         device = self.device
-        # if args.compile:
-        #     update_main = torch.compile(self._update_main)
-        #     update_pol = torch.compile(self._update_pol)
-        #     policy = torch.compile(self.policy)
-        #     normalize_obs = torch.compile(self.obs_normalizer.forward)
-        #     normalize_critic_obs = torch.compile(self.critic_obs_normalizer.forward)
-        # else:
-        update_main = self._update_main
-        update_pol = self._update_pol
-        policy = self.policy
-        normalize_obs = self.obs_normalizer.forward
-        normalize_critic_obs = self.critic_obs_normalizer.forward
+        if args.compile:
+            update_main = torch.compile(self._update_main)
+            update_pol = torch.compile(self._update_pol)
+            policy = torch.compile(self.policy)
+            normalize_obs = torch.compile(self.obs_normalizer.forward)
+            normalize_critic_obs = torch.compile(self.critic_obs_normalizer.forward)
+        else:
+            update_main = self._update_main
+            update_pol = self._update_pol
+            policy = self.policy
+            normalize_obs = self.obs_normalizer.forward
+            normalize_critic_obs = self.critic_obs_normalizer.forward
         qnet = self.qnet
         qnet_target = self.qnet_target
         env = self.env
         rb = self.rb
+        start_time = time.time()
 
         obs, critic_obs = env.reset_with_critic_obs()
         critic_obs = torch.as_tensor(critic_obs, device=device, dtype=torch.float)
@@ -861,145 +859,137 @@ class FastSACAgent(BaseAlgo):
         else:
             num_updates = int(args.num_updates)
 
+
+        # Logging stuff
+        ep_return = torch.zeros(env.num_envs, device=device)
+        ep_length = torch.zeros(env.num_envs, device=device)
+        rewbuffer = deque(maxlen=1000)
+        lenbuffer = deque(maxlen=1000)
+        total_episodes = 0
+        num_success_episodes_log = 0
+        num_episodes_log = 0
+
         while self.global_step <= args.num_learning_iterations:
             # Synchronize curriculum metrics across GPUs before rollout
             if self.is_multi_gpu:
                 self._synchronize_curriculum_metrics()
 
-            with self.logging_helper.record_collection_time():
-                with torch.no_grad(), self._maybe_amp():
-                    norm_obs = normalize_obs(obs, update=False)
-                    actions = policy(obs=norm_obs, dones=dones)
+            with torch.no_grad(), self._maybe_amp():
+                norm_obs = normalize_obs(obs, update=False)
+                actions = policy(obs=norm_obs, dones=dones)
 
-                next_obs, rewards, dones, infos = env.step(actions.float())
-                truncations = infos["time_outs"]
+            next_obs, rewards, dones, infos = env.step(actions.float())
+            truncations = infos["time_outs"]
+            next_critic_obs = infos["observations"]["critic"]
 
-                # Update episode stats using logging helper
-                self.logging_helper.update_episode_stats(rewards, dones, infos)
+            # Logging stuff
+            ep_return += rewards
+            ep_length += 1
+            rewbuffer.extend(ep_return[dones.bool()].cpu().tolist())
+            lenbuffer.extend(ep_length[dones.bool()].cpu().tolist())
+            num_episodes_log += dones.sum()
+            total_episodes += dones.sum()
+            num_success_episodes_log += infos["ep_success"].sum().cpu().item()
+            ep_return[dones.bool()] = 0
+            ep_length[dones.bool()] = 0
 
-                next_critic_obs = infos["observations"]["critic"]
-
-                # Compute 'true' next_obs and next_critic_obs for saving
-                true_next_obs = torch.where(
-                    truncations[:, None] > 0, infos["observations"]["final"]["actor_obs"], next_obs
-                )
-                true_next_critic_obs = torch.where(
-                    truncations[:, None] > 0,
-                    infos["observations"]["final"]["critic_obs"],
-                    next_critic_obs,
-                )
-                transition = TensorDict(
-                    {
-                        "observations": obs,
-                        "actions": torch.as_tensor(actions, device=device, dtype=torch.float),
-                        "next": {
-                            "observations": true_next_obs,
-                            "rewards": torch.as_tensor(rewards, device=device, dtype=torch.float),
-                            "truncations": truncations.long(),
-                            "dones": dones.long(),
-                        },
+            # Compute 'true' next_obs and next_critic_obs for saving
+            true_next_obs = torch.where(
+                truncations[:, None] > 0, infos["observations"]["final"]["actor_obs"], next_obs
+            )
+            true_next_critic_obs = torch.where(
+                truncations[:, None] > 0,
+                infos["observations"]["final"]["critic_obs"],
+                next_critic_obs,
+            )
+            transition = TensorDict(
+                {
+                    "observations": obs,
+                    "actions": torch.as_tensor(actions, device=device, dtype=torch.float),
+                    "next": {
+                        "observations": true_next_obs,
+                        "rewards": torch.as_tensor(rewards, device=device, dtype=torch.float),
+                        "truncations": truncations.long(),
+                        "dones": dones.long(),
                     },
-                    batch_size=(env.num_envs,),
-                    device=device,
-                )
-                transition["critic_observations"] = critic_obs
-                transition["next"]["critic_observations"] = true_next_critic_obs
+                },
+                batch_size=(env.num_envs,),
+                device=device,
+            )
+            transition["critic_observations"] = critic_obs
+            transition["next"]["critic_observations"] = true_next_critic_obs
 
-                obs = next_obs
-                critic_obs = next_critic_obs
+            obs = next_obs
+            critic_obs = next_critic_obs
 
-                rb.extend(transition)
+            rb.extend(transition)
 
-            # NOTE: args.batch_size is the global batch size
-            if len(self.logging_helper.ep_infos) > 0 and self.logging_helper.ep_infos[-1] != {}:
-                self.logging_helper._log_episode_info()
             batch_size = max(args.batch_size // env.num_envs // self.gpu_world_size, 1)
             if self.global_step > args.learning_starts:
-                with self.logging_helper.record_learn_time():
-                    if args.num_updates < 1 and self.global_step % int(1 / args.num_updates) != 0:
-                        self.global_step += 1
-                        pbar.update(1)
-                        continue
+                if args.num_updates < 1 and self.global_step % int(1 / args.num_updates) != 0:
+                    self.global_step += 1
+                    pbar.update(1)
+                    continue
 
-                    # Use batched sampling: sample once, normalize once, split into updates
-                    prepared_batches = self._sample_and_prepare_batches(
-                        batch_size, num_updates, normalize_obs, normalize_critic_obs
-                    )
-                    for i, data in enumerate(prepared_batches):
-                        # Data is already normalized, just run the updates
-                        (
-                            buffer_rewards,
-                            critic_grad_norm,
-                            qf_loss,
-                            qf_max,
-                            qf_min,
-                            alpha_loss,
-                            bc_critic_loss,
-                        ) = update_main(data)
-                        if self.expert_critic is not None:
-                            self.lambda_bc_critic *= 0.999
+                # Use batched sampling: sample once, normalize once, split into updates
+                prepared_batches = self._sample_and_prepare_batches(
+                    batch_size, num_updates, normalize_obs, normalize_critic_obs
+                )
+                for i, data in enumerate(prepared_batches):
+                    # Data is already normalized, just run the updates
+                    (
+                        buffer_rewards,
+                        critic_grad_norm,
+                        qf_loss,
+                        q_values,
+                        qf_max,
+                        qf_min,
+                        alpha_loss,
+                        bc_critic_loss,
+                    ) = update_main(data)
+                    if self.expert_critic is not None:
+                        self.lambda_bc_critic *= 0.999
 
-                        if num_updates > 1:
-                            if i % args.policy_frequency == 1:
-                                actor_grad_norm, actor_loss, policy_entropy, action_std, bc_policy_loss = update_pol(data)
-                                if self.expert_policy is not None:
-                                    self.lambda_bc_policy *= 0.999
-                        elif self.global_step % (args.policy_frequency * int(1 / args.num_updates)) == 0:
+                    if num_updates > 1:
+                        if i % args.policy_frequency == 1:
                             actor_grad_norm, actor_loss, policy_entropy, action_std, bc_policy_loss = update_pol(data)
                             if self.expert_policy is not None:
                                 self.lambda_bc_policy *= 0.999
+                    elif self.global_step % (args.policy_frequency * int(1 / args.num_updates)) == 0:
+                        actor_grad_norm, actor_loss, policy_entropy, action_std, bc_policy_loss = update_pol(data)
+                        if self.expert_policy is not None:
+                            self.lambda_bc_policy *= 0.999
 
-                        # Accumulate training metrics for smoother logging
-                        current_metrics = {
-                            "actor_loss": actor_loss,
-                            "qf_loss": qf_loss,
-                            "qf_max": qf_max,
-                            "qf_min": qf_min,
-                            "actor_grad_norm": actor_grad_norm,
-                            "critic_grad_norm": critic_grad_norm,
-                            "buffer_rewards": buffer_rewards,
-                            "alpha_loss": alpha_loss,
-                            "alpha_value": self.log_alpha.exp().detach().mean(),
-                            "policy_entropy": policy_entropy,
-                            "action_std": action_std,
-                            "bc_policy_loss": bc_policy_loss,
-                            "bc_critic_loss": bc_critic_loss,
-                            "expert_policy_active": torch.tensor(float(self.expert_policy is not None), device=self.device),
-                            "expert_critic_active": torch.tensor(float(self.expert_critic is not None), device=self.device),
-                        }
-                        self.training_metrics.add(current_metrics)
-
-                        with torch.no_grad():
-                            src_ps = [p.data for p in qnet.parameters()]
-                            tgt_ps = [p.data for p in qnet_target.parameters()]
-                            torch._foreach_mul_(tgt_ps, 1.0 - args.tau)
-                            torch._foreach_add_(tgt_ps, src_ps, alpha=args.tau)
+                    with torch.no_grad():
+                        src_ps = [p.data for p in qnet.parameters()]
+                        tgt_ps = [p.data for p in qnet_target.parameters()]
+                        torch._foreach_mul_(tgt_ps, 1.0 - args.tau)
+                        torch._foreach_add_(tgt_ps, src_ps, alpha=args.tau)
                 
-                # if self.global_step == 20000:
-                #     self.expert_rb = None
             
                 if self.global_step % args.logging_interval == 0:
-                    with torch.no_grad():
-                        # Use accumulated training metrics for smoother logging (reduces noise)
-                        accumulated_metrics = self.training_metrics.mean_and_clear()
+                    self.writer.add_scalar("losses/qf1_values", q_values[0].mean().item(), self.global_step)
+                    self.writer.add_scalar("losses/qf2_values", q_values[1].mean().item(), self.global_step)
+                    self.writer.add_scalar("losses/qf_loss", qf_loss.item() / 2.0, self.global_step)
+                    self.writer.add_scalar("losses/actor_loss", actor_loss.item(), self.global_step)
+                    self.writer.add_scalar("losses/alpha", self.log_alpha.exp(), self.global_step)
+                    sps = int(self.global_step / (time.time() - start_time))
+                    self.writer.add_scalar("charts/SPS", sps, self.global_step)
+                    samples_per_sec = sps * args.num_updates * args.batch_size * env.num_envs
+                    self.writer.add_scalar("charts/samples_per_sec", samples_per_sec, self.global_step)
 
-                        # Convert tensor values to float for logging
-                        loss_dict = {}
-                        for key, value in accumulated_metrics.items():
-                            if isinstance(value, torch.Tensor):
-                                loss_dict[key] = value.item()
-                            else:
-                                loss_dict[key] = float(value)
+                    if len(rewbuffer) > 0:
+                        self.writer.add_scalar("charts/episodic_return", statistics.mean(rewbuffer), self.global_step)
+                        self.writer.add_scalar("charts/episodic_length", statistics.mean(lenbuffer), self.global_step)
+                    
+                    self.writer.add_scalar("charts/success_rate", num_success_episodes_log / num_episodes_log, self.global_step)
+                    num_success_episodes_log = 0
+                    num_episodes_log = 0
 
-                        # Add current env rewards (not part of training loop accumulation)
-                        loss_dict["env_rewards"] = rewards.mean().item()
-                        print(f"lambda_bc_critic in learn: {self.lambda_bc_critic}")
-                        loss_dict["lambda_bc_critic"] = self.lambda_bc_critic
-                        loss_dict["lambda_bc_policy"] = self.lambda_bc_policy
-                        loss_dict["expert_ratio"] = self._current_expert_ratio
+                    self.writer.add_scalar("charts/num_episodes", total_episodes, self.global_step)
 
-                    # Use logging helper
-                    self.logging_helper.post_epoch_logging(it=self.global_step, loss_dict=loss_dict, extra_log_dicts={})
+                    if self.config.use_autotune:
+                        self.writer.add_scalar("losses/alpha_loss", alpha_loss.item(), self.global_step)
                 if args.save_interval > 0 and self.global_step > 0 and self.global_step % args.save_interval == 0:
                     if self.is_main_process:
                         logger.info(f"Saving model at global step {self.global_step}")
@@ -1040,7 +1030,6 @@ class FastSACAgent(BaseAlgo):
             self.scaler,
             self.config,
             path,
-            save_fn=self.logging_helper.save_checkpoint_artifact,
             env_state=env_state or None,
             metadata=self._checkpoint_metadata(iteration=self.global_step),
         )
@@ -1230,8 +1219,6 @@ class FastSACAgent(BaseAlgo):
             onnx_path=onnx_file_path,
             metadata=metadata,
         )
-
-        self.logging_helper.save_to_wandb(onnx_file_path)
 
         # Restore original training state
         if was_training:

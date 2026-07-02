@@ -100,8 +100,9 @@ class LoggingHelper:
         # Book keeping
         self.ep_infos: list[dict[str, Any]] = []
         self.raw_ep_infos: list[dict[str, Any]] = []
-        self.rewbuffer: deque[float] = deque(maxlen=100)
-        self.lenbuffer: deque[float] = deque(maxlen=100)
+        self.successbuffer: deque[float] = deque(maxlen=1000)
+        self.rewbuffer: deque[float] = deque(maxlen=1000)
+        self.lenbuffer: deque[float] = deque(maxlen=1000)
         self.cur_reward_sum: torch.Tensor = torch.zeros(num_envs, dtype=torch.float, device=self.device)
         self.cur_episode_length: torch.Tensor = torch.zeros(num_envs, dtype=torch.float, device=self.device)
         self.episode_env_tensors: TensorAverageMeterDict = TensorAverageMeterDict()
