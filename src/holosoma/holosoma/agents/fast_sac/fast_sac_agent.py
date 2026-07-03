@@ -973,10 +973,14 @@ class FastSACAgent(BaseAlgo):
                     self.writer.add_scalar("losses/qf_loss", qf_loss.item() / 2.0, self.global_step)
                     self.writer.add_scalar("losses/actor_loss", actor_loss.item(), self.global_step)
                     self.writer.add_scalar("losses/alpha", self.log_alpha.exp(), self.global_step)
-                    sps = int(self.global_step / (time.time() - start_time))
-                    self.writer.add_scalar("charts/SPS", sps, self.global_step)
-                    samples_per_sec = sps * args.num_updates * args.batch_size * env.num_envs
+                    sps = self.global_step / (time.time() - start_time)
+                    self.writer.add_scalar("charts/SPS", int(sps), self.global_step)
+                    samples_per_sec = int(sps * args.num_updates * args.batch_size * env.num_envs)
                     self.writer.add_scalar("charts/samples_per_sec", samples_per_sec, self.global_step)
+                    # Perf/total_fps: transitions/sec (matches old LoggingHelper convention for
+                    # direct comparison against Speed-Test / Speed-Test-Current runs).
+                    total_fps = int(sps * env.num_envs)
+                    self.writer.add_scalar("Perf/total_fps", total_fps, self.global_step)
 
                     if len(rewbuffer) > 0:
                         self.writer.add_scalar("charts/episodic_return", statistics.mean(rewbuffer), self.global_step)
