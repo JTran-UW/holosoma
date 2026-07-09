@@ -761,7 +761,7 @@ class FastSACAgent(BaseAlgo):
             n_obs=meta["n_obs"],
             n_act=meta["n_act"],
             n_critic_obs=meta["n_critic_obs"],
-            n_steps=1,
+            n_steps=self.config.num_steps,
             gamma=self.config.gamma,
             device=self.device,
         )
@@ -925,7 +925,7 @@ class FastSACAgent(BaseAlgo):
             rb.extend(transition)
 
             batch_size = max(args.batch_size // env.num_envs // self.gpu_world_size, 1)
-            if self.global_step > args.learning_starts:
+            if rb.ptr > args.learning_starts:
                 if args.num_updates < 1 and self.global_step % int(1 / args.num_updates) != 0:
                     self.global_step += 1
                     pbar.update(1)
@@ -1062,8 +1062,9 @@ class FastSACAgent(BaseAlgo):
             else:
                 normalized_obs = critic_obs
             q_outputs = qnet(normalized_obs, actions)  # [num_critics, batch, num_atoms]
-            q_values = qnet.get_value(F.softmax(q_outputs, dim=-1))  # [num_critics, batch]
-            return q_values.mean(dim=0)  # [batch]
+            q_dist = F.softmax(q_outputs, dim=-1)
+            q_values = qnet.get_value(q_dist)  # [num_critics, batch]
+            return q_values.mean(dim=0), q_dist  # [batch]
 
         return critic_fn
 
