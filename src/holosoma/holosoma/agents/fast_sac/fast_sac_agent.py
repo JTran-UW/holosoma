@@ -449,6 +449,16 @@ class FastSACAgent(BaseAlgo):
                     discount,
                 )
                 target_values = qnet_target.get_value(target_distributions)
+                if args.min_q_target:
+                    # Clipped double-Q target: per-sample, take whichever critic predicts the
+                    # LOWER value and share its full categorical distribution as the target for
+                    # every critic head's loss (reduces overestimation bias).
+                    batch_size = target_values.shape[1]
+                    min_idx = target_values.argmin(dim=0)  # [batch]
+                    batch_idx = torch.arange(batch_size, device=self.device)
+                    target_distributions = target_distributions[min_idx, batch_idx].unsqueeze(0).expand(
+                        target_distributions.shape[0], -1, -1
+                    )
                 target_value_max = target_values.max()
                 target_value_min = target_values.min()
 
@@ -552,7 +562,9 @@ class FastSACAgent(BaseAlgo):
             q_outputs = qnet(critic_observations, actions)
             q_probs = F.softmax(q_outputs, dim=-1)
             q_values = qnet.get_value(q_probs)
-            qf_value = q_values.mean(dim=0)
+            # Clipped double-Q: take the min across the critic ensemble instead of the mean,
+            # matching the standard SAC actor-loss convention (reduces overestimation bias).
+            qf_value = q_values.min(dim=0).values if args.min_q_target else q_values.mean(dim=0)
             actor_loss = (self.log_alpha.exp().detach() * log_probs - qf_value).mean()
 
             bc_policy_loss = torch.tensor(0.0, device=self.device)
