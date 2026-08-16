@@ -14,7 +14,7 @@ from loguru import logger
 
 from holosoma.agents.base_algo.base_algo import BaseAlgo
 from holosoma.agents.callbacks.base_callback import RLEvalCallback
-from holosoma.agents.fast_sac.fast_sac import Actor, CNNActor, CNNCritic, Critic
+from holosoma.agents.fast_sac.fast_sac import Actor, CNNActor, CNNCritic, Critic, PCActor, PCCritic
 from holosoma.agents.fast_sac.fast_sac_utils import (
     EmpiricalNormalization,
     SimpleReplayBuffer,
@@ -104,7 +104,8 @@ class FastSACEnv:
             "raw_episode": info_dict.get("raw_episode", {}),
             "raw_episode_all": info_dict.get("raw_episode_all", {}),
             "to_log": info_dict["to_log"],
-            "ep_success": info_dict["ep_success"]
+            "ep_success": info_dict["ep_success"],
+            "ep_counted": info_dict.get("ep_counted", 0),
         }
         return actor_obs, rew_buf, reset_buf, extras
 
@@ -149,6 +150,12 @@ class FastSACEnv:
         return action_scaling_factors
 
 
+# Minimum completed episodes before an episode-derived metric is logged. Below this the values
+# quantise hard: at low env counts a logging window can hold a single episode, so success_rate
+# reads 0.00 or 1.00 and the episodic means swing with one sample.
+MIN_EPISODES_TO_LOG = 100
+
+
 class FastSACAgent(BaseAlgo):
     """
     FastSAC is an efficient variant of Soft Actor-Critic (SAC) tuned for
@@ -163,7 +170,7 @@ class FastSACAgent(BaseAlgo):
     qnet: Critic
 
     def __init__(
-        self, env: BaseTask, config: FastSACConfig, device: str, log_dir: str, multi_gpu_cfg: dict | None = None, expert_policy=None, expert_critic=None, lambda_bc_policy=0.0, lambda_bc_critic=0.0
+        self, env: BaseTask, config: FastSACConfig, device: str, log_dir: str, multi_gpu_cfg: dict | None = None, expert_policy=None, expert_critic=None, lambda_bc_policy=0.0, lambda_bc_critic=0.0, use_cpu_rb=False
     ):
         wrapped_env = FastSACEnv(env, config.actor_obs_keys, config.critic_obs_keys)
 
@@ -181,6 +188,113 @@ class FastSACAgent(BaseAlgo):
         self.lambda_bc_critic = lambda_bc_critic
         self.expert_ratio: float = 0.5
         self.expert_ratio_anneal_steps: int = 0  # 0 = no annealing
+        self.rb_device = "cpu" if use_cpu_rb else self.device
+
+    def enable_sgft(self, shape_rewards: bool = True, h_step_backup: bool = False) -> None:
+        """Freeze the live actor/critic as a source value function for reward shaping.
+
+        SGFT replaces each stored reward with
+
+            r_hat = r + gamma * Phi(s') - Phi(s),   Phi(s) = mean_i Q_i(s, mu(s))
+
+        where mu is the frozen source actor's deterministic action. This is potential-based
+        shaping, so the optimal policy is unchanged -- it only redistributes credit toward
+        states the source policy already valued.
+
+        MUST be called after load(): it snapshots whatever weights are live at the time. The
+        observation normalizers are snapshotted too, because they keep updating during training
+        and a frozen network behind a live normalizer would not be a fixed function of s.
+        """
+        self._sgft_actor = copy.deepcopy(self.actor).eval().requires_grad_(False)
+        self._sgft_qnet = copy.deepcopy(self.qnet).eval().requires_grad_(False)
+        self._sgft_obs_norm = copy.deepcopy(self.obs_normalizer).eval().requires_grad_(False)
+        self._sgft_critic_obs_norm = copy.deepcopy(self.critic_obs_normalizer).eval().requires_grad_(False)
+        self.sgft_enabled = True
+        self.sgft_shaping = shape_rewards
+        self.h_step_backup = h_step_backup
+        logger.info(
+            f"SGFT source frozen from the loaded checkpoint | reward shaping={shape_rewards} | "
+            f"h-step backup={h_step_backup}"
+        )
+        if shape_rewards and h_step_backup:
+            logger.warning(
+                "SGFT: reward shaping AND h-step backup are both on. The shaped n-step return "
+                "already telescopes to (raw + gamma^n * V(s_n) - V(s_0)), and the h-step target "
+                "adds gamma^n * V(s_n) again -- V_source is counted twice. They are normally "
+                "alternatives; enable only one unless you specifically want the doubled term."
+            )
+        if shape_rewards and self.expert_rb is not None:
+            self._sgft_shape_expert_buffer()
+
+    def _renorm_to_source(self, x_norm: torch.Tensor, live: nn.Module, src: nn.Module) -> torch.Tensor:
+        """Re-express an obs normalized by the LIVE normalizer in the FROZEN source's frame.
+
+        Batches reaching the update are already normalized with the live running statistics, which
+        keep moving. Feeding them straight to the frozen source would silently drift V_source as
+        training progresses -- exactly what freezing was meant to prevent. Undo the live transform
+        and reapply the snapshotted one.
+        """
+        if not self.obs_normalization:
+            return x_norm
+        raw = x_norm * (live._std + live.eps) + live._mean
+        return (raw - src._mean) / (src._std + src.eps)
+
+    @torch.no_grad()
+    def sgft_value(self, actor_obs: torch.Tensor, critic_obs: torch.Tensor) -> torch.Tensor:
+        """Phi(s) = mean_i Q_i(s, mu(s)) under the frozen source networks. Shape [batch]."""
+        a_in = self._sgft_obs_norm(actor_obs, update=False) if self.obs_normalization else actor_obs
+        c_in = self._sgft_critic_obs_norm(critic_obs, update=False) if self.obs_normalization else critic_obs
+        action = self._sgft_actor(a_in)[0]  # forward returns (action, mean, log_std); [0] is deterministic
+        q_logits = self._sgft_qnet(c_in, action)  # [num_critics, batch, num_atoms]
+        q = self._sgft_qnet.get_value(F.softmax(q_logits, dim=-1))  # [num_critics, batch]
+        return q.mean(dim=0)
+
+    @torch.no_grad()
+    def sgft_shaped_rewards(
+        self, obs, critic_obs, next_obs, next_critic_obs, rewards, dones, truncations, gamma
+    ) -> torch.Tensor:
+        """r_hat = r + gamma * Phi(s') - Phi(s), with Phi(s') forced to 0 on true terminations.
+
+        Terminations zero the potential for two independent reasons: it is the standard
+        potential-based convention (policy invariance only holds when an absorbing state has
+        potential 0), and `next_obs` is the POST-RESET observation on terminations -- only
+        truncations carry the true final obs -- so Phi(next_obs) would be read off an unrelated
+        state and inject a spurious bonus at every episode boundary.
+        """
+        phi_s = self.sgft_value(obs, critic_obs)
+        phi_next = self.sgft_value(next_obs, next_critic_obs)
+        terminated = dones.bool() & ~truncations.bool()
+        phi_next = torch.where(terminated, torch.zeros_like(phi_next), phi_next)
+        return rewards + gamma * phi_next - phi_s
+
+    @torch.no_grad()
+    def _sgft_shape_expert_buffer(self) -> None:
+        """Rewrite the expert buffer's rewards with the same shaping, once, in place.
+
+        Without this a mixed batch would carry two different reward definitions and the critic
+        would regress to an inconsistent target. Chunked over the capacity axis so a multi-GB
+        buffer never has to be resident on the compute device all at once.
+        """
+        rb = self.expert_rb
+        n_env, cap = rb.observations.shape[0], rb.observations.shape[1]
+        n_obs, n_cobs = rb.observations.shape[-1], rb.critic_observations.shape[-1]
+        gamma = self.config.gamma
+        chunk = max(1, 2 ** 20 // max(n_env * max(n_obs, 1), 1))
+        for s in range(0, cap, chunk):
+            e = min(s + chunk, cap)
+            dev = self.device
+            r_hat = self.sgft_shaped_rewards(
+                rb.observations[:, s:e].reshape(-1, n_obs).to(dev),
+                rb.critic_observations[:, s:e].reshape(-1, n_cobs).to(dev),
+                rb.next_observations[:, s:e].reshape(-1, n_obs).to(dev),
+                rb.next_critic_observations[:, s:e].reshape(-1, n_cobs).to(dev),
+                rb.rewards[:, s:e].reshape(-1).to(dev),
+                rb.dones[:, s:e].reshape(-1).to(dev),
+                rb.truncations[:, s:e].reshape(-1).to(dev),
+                gamma,
+            )
+            rb.rewards[:, s:e] = r_hat.view(n_env, e - s).to(rb.rewards.device)
+        logger.info(f"SGFT: shaped {n_env * cap} expert transitions in place (chunk={chunk})")
 
     @property
     def _current_expert_ratio(self) -> float:
@@ -261,14 +375,19 @@ class FastSACAgent(BaseAlgo):
         action_bias = torch.zeros(n_act, device=device)  # Assuming zero bias for now
 
         # Handle CNN actor/critic
-        if args.use_cnn_encoder:
+        if args.use_cnn_encoder or args.use_pc_encoder:
             # We assume that MLP doesn't take raw encoder observations
             actor_mlp_obs_keys = [k for k in actor_obs_keys if k != args.encoder_obs_key]
             critic_mlp_obs_keys = [k for k in critic_obs_keys if k != args.encoder_obs_key]
+
+            if args.use_cnn_encoder:
+                actor_cls, critic_cls = (CNNActor, CNNCritic)
+            else:
+                actor_cls, critic_cls = (PCActor, PCCritic)
         else:
             actor_mlp_obs_keys = list(actor_obs_keys)
             critic_mlp_obs_keys = list(critic_obs_keys)
-        actor_cls, critic_cls = (CNNActor, CNNCritic) if args.use_cnn_encoder else (Actor, Critic)
+            actor_cls, critic_cls = (Actor, Critic)
 
         self.actor = actor_cls(
             obs_indices=self.actor_obs_indices,
@@ -343,17 +462,47 @@ class FastSACAgent(BaseAlgo):
 
         logger.info(f"actor_obs_dim: {actor_obs_dim}, critic_obs_dim: {critic_obs_dim}")
 
+        # Only the first num_collect_envs envs feed the buffer. The rest still step and still count
+        # toward the logged episode statistics -- that is the whole point: at 1 collecting env a
+        # logging window holds ~0.6 episodes, so success_rate is a coin flip, while 128 stepping envs
+        # give ~80 episodes per window for ~17% throughput. Sizing the buffer by env.num_envs instead
+        # would also multiply its memory by the eval envs (128 x 1e6 transitions is ~448 GB).
+        self.num_collect_envs = args.num_collect_envs or env.num_envs
+        if not 1 <= self.num_collect_envs <= env.num_envs:
+            raise ValueError(
+                f"num_collect_envs={self.num_collect_envs} must be in [1, num_envs={env.num_envs}]"
+            )
+        if self.num_collect_envs != env.num_envs:
+            logger.info(
+                f"Collecting from {self.num_collect_envs}/{env.num_envs} envs; the other "
+                f"{env.num_envs - self.num_collect_envs} step for episode statistics only."
+            )
         self.rb = SimpleReplayBuffer(
-            n_env=env.num_envs,
+            n_env=self.num_collect_envs,
             buffer_size=args.buffer_size,
             n_obs=actor_obs_dim,
             n_act=n_act,
             n_critic_obs=critic_obs_dim,
             n_steps=args.num_steps,
             gamma=args.gamma,
-            device=device,
+            device=self.rb_device,
         )
         self.expert_rb: SimpleReplayBuffer | None = None
+
+        # getattr: this agent is fed by two config lineages (holosoma FastSACConfig and
+        # isaaclab_rl RslRlOffPolicyRunnerCfg); tolerate one that predates this field.
+        if getattr(args, "load_replay_buffer_path", ""):
+            self.load_replay_buffer(args.load_replay_buffer_path)
+
+        # SGFT: frozen source value function used for potential-based reward shaping.
+        # Populated by enable_sgft(); never trained, never updated.
+        self.sgft_enabled: bool = False      # source frozen and available
+        self.sgft_shaping: bool = False      # rewrite stored rewards as r + gamma*V(s') - V(s)
+        self.h_step_backup: bool = False     # bootstrap the n-step target off V_source, not Q_target
+        self._sgft_actor: nn.Module | None = None
+        self._sgft_qnet: nn.Module | None = None
+        self._sgft_obs_norm: nn.Module | None = None
+        self._sgft_critic_obs_norm: nn.Module | None = None
 
         if args.use_symmetry:
             # using env._env is not really ideal..
@@ -423,32 +572,58 @@ class FastSACAgent(BaseAlgo):
 
         with self._maybe_amp():
             next_observations = data["next"]["observations"]
-            unnormed_next_observations = data["next"]["unnormed_observations"]
             critic_observations = data["critic_observations"]
             next_critic_observations = data["next"]["critic_observations"]
-            unnormed_next_critic_observations = data["next"]["unnormed_critic_observations"]
             actions = data["actions"]
             rewards = data["next"]["rewards"]
             dones = data["next"]["dones"].bool()
             truncations = data["next"]["truncations"].bool()
 
-            # NOTE: We are switching to bootstrap=true if all dones are false (including truncation)
-            # This is because timeout/truncation IS terminal in reaching/peg-insertion MDP
-            # bootstrap = (truncations | ~dones).float()
-            bootstrap = (~dones).float()
+            # `dones` is terminated | truncated (see the vec-env wrapper), so the default masks the
+            # bootstrap on timeouts too, treating them as true terminals. With handle_truncations
+            # the target bootstraps through a truncation and only real terminations zero it; the
+            # rollout already stores the pre-reset final observation for those steps, so the
+            # bootstrapped value is taken at the correct state.
+            if args.handle_truncations:
+                bootstrap = (truncations | ~dones).float()
+            else:
+                bootstrap = (~dones).float()
 
             with torch.no_grad():
                 next_state_actions, next_state_log_probs = actor.get_actions_and_log_probs(next_observations)
                 discount = args.gamma ** data["next"]["effective_n_steps"]
 
-                target_distributions = qnet_target.projection(
-                    next_critic_observations,
-                    next_state_actions,
-                    rewards - discount * bootstrap * self.log_alpha.exp() * next_state_log_probs,
-                    bootstrap,
-                    discount,
-                )
-                target_values = qnet_target.get_value(target_distributions)
+                if self.h_step_backup:
+                    # h-step backup: the n-step return bootstraps off the FROZEN source critic
+                    # instead of the learned target critic. The source is distributional, so its
+                    # atom distribution goes through the same categorical Bellman projection --
+                    # collapsing it to a scalar point mass would discard the return distribution
+                    # the C51 cross-entropy is regressing against.
+                    #
+                    # The entropy bonus is deliberately dropped here: V_source is a hard value
+                    # function carrying no entropy term, so subtracting alpha*log_pi from a target
+                    # built on it would mix two different value definitions.
+                    src_next_obs = self._renorm_to_source(
+                        next_observations, self.obs_normalizer, self._sgft_obs_norm
+                    )
+                    src_next_critic_obs = self._renorm_to_source(
+                        next_critic_observations, self.critic_obs_normalizer, self._sgft_critic_obs_norm
+                    )
+                    src_actions = self._sgft_actor(src_next_obs)[0]  # deterministic source action
+                    target_net = self._sgft_qnet
+                    target_distributions = target_net.projection(
+                        src_next_critic_obs, src_actions, rewards, bootstrap, discount,
+                    )
+                else:
+                    target_net = qnet_target
+                    target_distributions = target_net.projection(
+                        next_critic_observations,
+                        next_state_actions,
+                        rewards - discount * bootstrap * self.log_alpha.exp() * next_state_log_probs,
+                        bootstrap,
+                        discount,
+                    )
+                target_values = target_net.get_value(target_distributions)
                 if args.min_q_target:
                     # Clipped double-Q target: per-sample, take whichever critic predicts the
                     # LOWER value and share its full categorical distribution as the target for
@@ -616,7 +791,7 @@ class FastSACAgent(BaseAlgo):
             # Expert rb may have a different n_env from the online env, so we
             # compute a per-env count that lands at ~expert_ratio of total samples.
             main_per_env = max(round(batch_size * (1.0 - self._current_expert_ratio)), 1)
-            target_expert_total_per_update = (batch_size - main_per_env) * self.env.num_envs
+            target_expert_total_per_update = (batch_size - main_per_env) * self.rb.n_env
             expert_per_env = max(target_expert_total_per_update // self.expert_rb.n_env, 1)
 
             per_update_batches = []
@@ -628,7 +803,7 @@ class FastSACAgent(BaseAlgo):
             samples_per_update = large_data["actions"].shape[0] // num_updates
         else:
             large_data = self.rb.sample(large_batch_size)
-            samples_per_update = batch_size * self.env.num_envs
+            samples_per_update = batch_size * self.rb.n_env
 
         if self.config.use_symmetry:
             samples_per_update *= 2
@@ -673,12 +848,9 @@ class FastSACAgent(BaseAlgo):
             large_data = augmented_large_data
 
         # Normalize all data once
-        large_data["unnormed_observations"] = large_data["observations"]
-        large_data["next"]["unnormed_observations"] = large_data["next"]["observations"]
+        large_data = large_data.to(self.device)
         large_data["observations"] = normalize_obs(large_data["observations"])
         large_data["next"]["observations"] = normalize_obs(large_data["next"]["observations"])
-        large_data["unnormed_critic_observations"] = large_data["critic_observations"]
-        large_data["next"]["unnormed_critic_observations"] = large_data["next"]["critic_observations"]
         large_data["critic_observations"] = normalize_critic_obs(large_data["critic_observations"])
         large_data["next"]["critic_observations"] = normalize_critic_obs(large_data["next"]["critic_observations"])
 
@@ -693,23 +865,19 @@ class FastSACAgent(BaseAlgo):
             batch_data = TensorDict(
                 {
                     "observations": large_data["observations"][start_idx:end_idx],
-                    "unnormed_observations": large_data["unnormed_observations"][start_idx:end_idx],
                     "actions": large_data["actions"][start_idx:end_idx],
                     "next": {
                         "rewards": large_data["next"]["rewards"][start_idx:end_idx],
                         "dones": large_data["next"]["dones"][start_idx:end_idx],
                         "truncations": large_data["next"]["truncations"][start_idx:end_idx],
-                        "unnormed_observations": large_data["next"]["unnormed_observations"][start_idx:end_idx],
                         "observations": large_data["next"]["observations"][start_idx:end_idx],
                         "effective_n_steps": large_data["next"]["effective_n_steps"][start_idx:end_idx],
                     },
                     "critic_observations": large_data["critic_observations"][start_idx:end_idx],
-                    "unnormed_critic_observations": large_data["unnormed_critic_observations"][start_idx:end_idx],
                 },
                 batch_size=samples_per_update,
             )
             batch_data["next"]["critic_observations"] = large_data["next"]["critic_observations"][start_idx:end_idx]
-            batch_data["next"]["unnormed_critic_observations"] = large_data["next"]["unnormed_critic_observations"][start_idx:end_idx]
 
             prepared_batches.append(batch_data)
 
@@ -751,7 +919,7 @@ class FastSACAgent(BaseAlgo):
         if not path:
             return
 
-        payload = torch.load(path, map_location=self.device, weights_only=False)
+        payload = torch.load(path, map_location=self.rb_device, weights_only=False)
         tensors = payload["buffer_tensors"]
         meta = payload["metadata"]
 
@@ -775,16 +943,16 @@ class FastSACAgent(BaseAlgo):
             n_critic_obs=meta["n_critic_obs"],
             n_steps=self.config.num_steps,
             gamma=self.config.gamma,
-            device=self.device,
+            device=self.rb_device,
         )
-        expert_rb.observations.copy_(tensors["observations"].to(self.device))
-        expert_rb.actions.copy_(tensors["actions"].to(self.device))
-        expert_rb.rewards.copy_(tensors["rewards"].to(self.device))
-        expert_rb.dones.copy_(tensors["dones"].to(self.device))
-        expert_rb.truncations.copy_(tensors["truncations"].to(self.device))
-        expert_rb.next_observations.copy_(tensors["next_observations"].to(self.device))
-        expert_rb.critic_observations.copy_(tensors["critic_observations"].to(self.device))
-        expert_rb.next_critic_observations.copy_(tensors["next_critic_observations"].to(self.device))
+        expert_rb.observations.copy_(tensors["observations"].to(self.rb_device))
+        expert_rb.actions.copy_(tensors["actions"].to(self.rb_device))
+        expert_rb.rewards.copy_(tensors["rewards"].to(self.rb_device))
+        expert_rb.dones.copy_(tensors["dones"].to(self.rb_device))
+        expert_rb.truncations.copy_(tensors["truncations"].to(self.rb_device))
+        expert_rb.next_observations.copy_(tensors["next_observations"].to(self.rb_device))
+        expert_rb.critic_observations.copy_(tensors["critic_observations"].to(self.rb_device))
+        expert_rb.next_critic_observations.copy_(tensors["next_critic_observations"].to(self.rb_device))
         expert_rb.ptr = int(tensors["ptr"])
 
         self.expert_rb = expert_rb
@@ -815,44 +983,78 @@ class FastSACAgent(BaseAlgo):
         logger.info(f"Saved replay buffer ({rb.n_env * rb.buffer_size} transitions) to {path}")
 
     def load_replay_buffer(self, path: str) -> None:
-        """Restore a previously saved online replay buffer."""
+        """Restore a previously saved online replay buffer.
+
+        The saved buffer length need not match the live one: the first ``min(src, dst)`` slots are
+        filled and the remainder is left zeroed for online data. ``ptr`` is set to the number of
+        valid loaded entries, so sampling only draws from those and the next write appends after
+        them. The env count must still match exactly (see scripts/.../slice_rb_envs.py).
+        """
         payload = torch.load(path, map_location=self.device, weights_only=False)
         rb = self.rb
-        rb.observations.copy_(payload["observations"].to(self.device))
-        rb.actions.copy_(payload["actions"].to(self.device))
-        rb.rewards.copy_(payload["rewards"].to(self.device))
-        rb.dones.copy_(payload["dones"].to(self.device))
-        rb.truncations.copy_(payload["truncations"].to(self.device))
-        rb.next_observations.copy_(payload["next_observations"].to(self.device))
-        rb.critic_observations.copy_(payload["critic_observations"].to(self.device))
-        rb.next_critic_observations.copy_(payload["next_critic_observations"].to(self.device))
-        rb.ptr = payload["ptr"]
+        if int(payload["n_env"]) != rb.n_env:
+            raise ValueError(
+                f"replay buffer env count mismatch: file has n_env={int(payload['n_env'])}, "
+                f"run has n_env={rb.n_env}. Slice the file with slice_rb_envs.py first."
+            )
+        n = min(int(payload["buffer_size"]), rb.buffer_size)
+        for key in (
+            "observations",
+            "actions",
+            "rewards",
+            "dones",
+            "truncations",
+            "next_observations",
+            "critic_observations",
+            "next_critic_observations",
+        ):
+            getattr(rb, key)[:, :n].copy_(payload[key][:, :n].to(self.device))
+        rb.ptr = min(int(payload["ptr"]), n)
         logger.info(
             f"Loaded replay buffer from {path}: "
-            f"n_env={payload['n_env']}, buffer_size={payload['buffer_size']}, ptr={rb.ptr}, "
+            f"n_env={payload['n_env']}, buffer_size={payload['buffer_size']} -> {rb.buffer_size} "
+            f"(filled first {n} slots), ptr={rb.ptr}, "
             f"saved at global_step={payload.get('global_step', 'unknown')}"
         )
 
     def learn(self) -> None:
         args = self.config
         device = self.device
-        if args.compile:
-            update_main = torch.compile(self._update_main)
-            update_pol = torch.compile(self._update_pol)
-            policy = torch.compile(self.policy)
-            normalize_obs = torch.compile(self.obs_normalizer.forward)
-            normalize_critic_obs = torch.compile(self.critic_obs_normalizer.forward)
-        else:
-            update_main = self._update_main
-            update_pol = self._update_pol
-            policy = self.policy
-            normalize_obs = self.obs_normalizer.forward
-            normalize_critic_obs = self.critic_obs_normalizer.forward
+        # if args.compile:
+        #     update_main = torch.compile(self._update_main)
+        #     update_pol = torch.compile(self._update_pol)
+        #     policy = torch.compile(self.policy)
+        #     normalize_obs = torch.compile(self.obs_normalizer.forward)
+        #     normalize_critic_obs = torch.compile(self.critic_obs_normalizer.forward)
+        # else:
+        update_main = self._update_main
+        update_pol = self._update_pol
+        policy = self.policy
+        normalize_obs = self.obs_normalizer.forward
+        normalize_critic_obs = self.critic_obs_normalizer.forward
         qnet = self.qnet
         qnet_target = self.qnet_target
         env = self.env
         rb = self.rb
         start_time = time.time()
+
+        # no_learning: hold actor, critic, target critic and alpha fixed for the whole run.
+        # Enforced HERE rather than in setup() on purpose -- load() calls
+        # optimizer.load_state_dict(), which restores param_groups including `lr` from the
+        # checkpoint and therefore silently overwrites any learning rate configured earlier. That
+        # is why passing agent.*_learning_rate=0.0 on a resumed run did not actually freeze
+        # anything. tau is applied directly in the target EMA below, so it is overridden too.
+        # Forward passes still run, so Q/loss diagnostics keep logging; only updates are suppressed.
+        tau_eff = args.tau
+        if args.no_learning:
+            for _opt in (self.actor_optimizer, self.q_optimizer, self.alpha_optimizer):
+                for _g in _opt.param_groups:
+                    _g["lr"] = 0.0
+            tau_eff = 0.0
+            logger.info(
+                "no_learning=True: all optimizer learning rates forced to 0 and tau forced to 0 "
+                "after checkpoint load; networks and alpha are frozen for this run."
+            )
 
         obs, critic_obs = env.reset_with_critic_obs()
         critic_obs = torch.as_tensor(critic_obs, device=device, dtype=torch.float)
@@ -866,10 +1068,29 @@ class FastSACAgent(BaseAlgo):
         bc_policy_loss = torch.tensor(0.0, device=device)
         pbar = tqdm.tqdm(total=args.num_learning_iterations, initial=self.global_step)
     
+        # Resolve the update schedule once: `num_updates` gradient steps every `update_every` env
+        # steps. These are independent knobs -- num_updates alone could only express "N per step"
+        # or "1 per N steps", never "N per M steps".
+        _interval = int(getattr(args, "update_interval", 1) or 1)
         if args.num_updates < 1:
+            # Legacy encoding: a fractional count means one update every int(1/num_updates) steps.
+            if _interval != 1:
+                raise ValueError(
+                    f"num_updates={args.num_updates} (<1) already encodes an interval of "
+                    f"{int(1 / args.num_updates)} steps; combining it with update_interval="
+                    f"{_interval} is ambiguous. Use num_updates>=1 with update_interval instead."
+                )
             num_updates = 1
+            update_every = int(1 / args.num_updates)
         else:
             num_updates = int(args.num_updates)
+            update_every = max(_interval, 1)
+        critic_updates = 0  # drives the delayed policy update; see the loop below
+        logger.info(
+            f"update schedule: {num_updates} update(s) every {update_every} env step(s) "
+            f"-> replay ratio {num_updates / update_every:g} updates/step; "
+            f"actor every {args.policy_frequency} critic updates"
+        )
 
 
         # Logging stuff
@@ -880,6 +1101,15 @@ class FastSACAgent(BaseAlgo):
         total_episodes = 0
         num_success_episodes_log = 0
         num_episodes_log = 0
+        # Latest value of each "Curriculum/<term>/<key>" the env reported. Only tasks with an
+        # active curriculum manager (the Finetune configs) emit these, so this stays empty and
+        # logs nothing for every other task. The env only populates the episode log on steps
+        # where something reset, hence the carry-forward.
+        curriculum_log: dict[str, float] = {}
+        # Loss scalars from the most recent update round. Logging fires on its own interval, which
+        # includes steps where no update ran (and steps before learning_starts), so these cannot be
+        # read straight off loop locals -- they would be undefined on the first logged step.
+        last_update_stats: dict[str, float] = {}
 
         while self.global_step <= args.num_learning_iterations:
             # Synchronize curriculum metrics across GPUs before rollout
@@ -899,9 +1129,26 @@ class FastSACAgent(BaseAlgo):
             ep_length += 1
             rewbuffer.extend(ep_return[dones.bool()].cpu().tolist())
             lenbuffer.extend(ep_length[dones.bool()].cpu().tolist())
-            num_episodes_log += dones.sum()
+            # Denominator comes from ep_counted, not dones: the env drops episodes cut short by
+            # first_episode_termination, so numerator and denominator must agree on which episodes
+            # count. Using dones here would put those staggering kills back in as failures.
+            num_episodes_log += int(infos.get("ep_counted", int(dones.sum())))
             total_episodes += dones.sum()
             num_success_episodes_log += infos["ep_success"].sum().cpu().item()
+            # `metrics/` carries MultiResetManager's per-reset-type success rates, so a task with a
+            # mixed reset distribution gets one success curve per path instead of a single pooled
+            # number. Both prefixes are carried forward because the env only populates the episode
+            # log on steps where something actually reset.
+            for key, value in (infos.get("episode") or {}).items():
+                if key.startswith(("Curriculum/", "metrics/")):
+                    curriculum_log[key] = value.item() if torch.is_tensor(value) else float(value)
+                elif key.startswith("Episode_Termination/"):
+                    # Already a proportion, not a count: TerminationManager latches each env's most
+                    # recently completed episode and reports the per-term mean over all envs.
+                    term_name = key[len("Episode_Termination/") :]
+                    curriculum_log[f"charts/termination_{term_name}"] = (
+                        value.item() if torch.is_tensor(value) else float(value)
+                    )
             ep_return[dones.bool()] = 0
             ep_length[dones.bool()] = 0
 
@@ -914,13 +1161,23 @@ class FastSACAgent(BaseAlgo):
                 infos["observations"]["final"]["critic_obs"],
                 next_critic_obs,
             )
+            # SGFT shaping is applied to what gets STORED, not to what gets logged: ep_return
+            # above already accumulated the raw env reward, so reported episodic return stays
+            # comparable across shaped and unshaped runs.
+            store_rewards = rewards
+            if self.sgft_enabled and self.sgft_shaping:
+                store_rewards = self.sgft_shaped_rewards(
+                    obs, critic_obs, true_next_obs, true_next_critic_obs,
+                    rewards, dones, truncations, args.gamma,
+                )
+
             transition = TensorDict(
                 {
                     "observations": obs,
                     "actions": torch.as_tensor(actions, device=device, dtype=torch.float),
                     "next": {
                         "observations": true_next_obs,
-                        "rewards": torch.as_tensor(rewards, device=device, dtype=torch.float),
+                        "rewards": torch.as_tensor(store_rewards, device=device, dtype=torch.float),
                         "truncations": truncations.long(),
                         "dones": dones.long(),
                     },
@@ -934,15 +1191,17 @@ class FastSACAgent(BaseAlgo):
             obs = next_obs
             critic_obs = next_critic_obs
 
-            rb.extend(transition)
+            # Slice to the collecting envs; the rest contribute statistics only.
+            rb.extend(transition if rb.n_env == env.num_envs else transition[: rb.n_env])
 
-            batch_size = max(args.batch_size // env.num_envs // self.gpu_world_size, 1)
-            if rb.ptr > args.learning_starts:
-                if args.num_updates < 1 and self.global_step % int(1 / args.num_updates) != 0:
-                    self.global_step += 1
-                    pbar.update(1)
-                    continue
-
+            # rb.n_env, not env.num_envs: sample() returns rb.n_env * batch_size rows, so dividing by
+            # the stepping env count would shrink the real batch by the eval-env factor.
+            batch_size = max(args.batch_size // rb.n_env // self.gpu_world_size, 1)
+            # Updates fire on the update schedule; logging and checkpointing must not. Gating those
+            # behind the same `continue` meant a point was only written when global_step hit a
+            # multiple of BOTH update_every and the interval -- every 800 steps for
+            # update_interval=160 / logging_interval=100 -- and nothing at all before learning_starts.
+            if rb.ptr > args.learning_starts and not (update_every > 1 and self.global_step % update_every != 0):
                 # Use batched sampling: sample once, normalize once, split into updates
                 prepared_batches = self._sample_and_prepare_batches(
                     batch_size, num_updates, normalize_obs, normalize_critic_obs
@@ -962,12 +1221,14 @@ class FastSACAgent(BaseAlgo):
                     if self.expert_critic is not None:
                         self.lambda_bc_critic *= 0.999
 
-                    if num_updates > 1:
-                        if i % args.policy_frequency == 1:
-                            actor_grad_norm, actor_loss, policy_entropy, action_std, bc_policy_loss = update_pol(data)
-                            if self.expert_policy is not None:
-                                self.lambda_bc_policy *= 0.999
-                    elif self.global_step % (args.policy_frequency * int(1 / args.num_updates)) == 0:
+                    # Delayed policy update, counted over ALL critic updates rather than special-
+                    # cased per schedule. The previous form divided by int(1/num_updates), which is
+                    # 0 for any num_updates>=2 -- fine while such runs always took the other branch,
+                    # fatal now that a round of N updates can also fire on an interval. Counting
+                    # also fixes rounds shorter than policy_frequency, where the old within-round
+                    # `i % policy_frequency == 1` test gave the wrong actor:critic ratio.
+                    critic_updates += 1
+                    if critic_updates % args.policy_frequency == 0:
                         actor_grad_norm, actor_loss, policy_entropy, action_std, bc_policy_loss = update_pol(data)
                         if self.expert_policy is not None:
                             self.lambda_bc_policy *= 0.999
@@ -975,47 +1236,70 @@ class FastSACAgent(BaseAlgo):
                     with torch.no_grad():
                         src_ps = [p.data for p in qnet.parameters()]
                         tgt_ps = [p.data for p in qnet_target.parameters()]
-                        torch._foreach_mul_(tgt_ps, 1.0 - args.tau)
-                        torch._foreach_add_(tgt_ps, src_ps, alpha=args.tau)
-                
-            
-                if self.global_step % args.logging_interval == 0:
-                    self.writer.add_scalar("losses/qf1_values", q_values[0].mean().item(), self.global_step)
-                    self.writer.add_scalar("losses/qf2_values", q_values[1].mean().item(), self.global_step)
-                    self.writer.add_scalar("losses/qf_loss", qf_loss.item() / 2.0, self.global_step)
-                    self.writer.add_scalar("losses/actor_loss", actor_loss.item(), self.global_step)
-                    self.writer.add_scalar("losses/alpha", self.log_alpha.exp(), self.global_step)
-                    sps = self.global_step / (time.time() - start_time)
-                    self.writer.add_scalar("charts/SPS", int(sps), self.global_step)
-                    samples_per_sec = int(sps * args.num_updates * args.batch_size * env.num_envs)
-                    self.writer.add_scalar("charts/samples_per_sec", samples_per_sec, self.global_step)
-                    # Perf/total_fps: transitions/sec (matches old LoggingHelper convention for
-                    # direct comparison against Speed-Test / Speed-Test-Current runs).
-                    total_fps = int(sps * env.num_envs)
-                    self.writer.add_scalar("Perf/total_fps", total_fps, self.global_step)
+                        torch._foreach_mul_(tgt_ps, 1.0 - tau_eff)
+                        torch._foreach_add_(tgt_ps, src_ps, alpha=tau_eff)
 
-                    if len(rewbuffer) > 0:
-                        self.writer.add_scalar("charts/episodic_return", statistics.mean(rewbuffer), self.global_step)
-                        self.writer.add_scalar("charts/episodic_length", statistics.mean(lenbuffer), self.global_step)
-                    
-                    self.writer.add_scalar("charts/success_rate", num_success_episodes_log / num_episodes_log, self.global_step)
+                # Snapshot after the round so the logging block below, which also runs on steps with
+                # no update, has something well-defined to write.
+                last_update_stats["losses/qf1_values"] = q_values[0].mean().item()
+                last_update_stats["losses/qf2_values"] = q_values[1].mean().item()
+                last_update_stats["losses/qf_loss"] = qf_loss.item() / 2.0
+                last_update_stats["losses/alpha"] = float(self.log_alpha.exp())
+                if critic_updates >= args.policy_frequency:
+                    last_update_stats["losses/actor_loss"] = actor_loss.item()
+                if self.config.use_autotune:
+                    last_update_stats["losses/alpha_loss"] = alpha_loss.item()
+
+            if self.global_step % args.logging_interval == 0:
+                for _k, _v in last_update_stats.items():
+                    self.writer.add_scalar(_k, _v, self.global_step)
+                sps = self.global_step / (time.time() - start_time)
+                self.writer.add_scalar("charts/SPS", int(sps), self.global_step)
+                # Use the realized replay ratio, not args.num_updates: with update_interval>1
+                # the round only fires every update_every steps, so args.num_updates alone
+                # overstates throughput by exactly that factor.
+                samples_per_sec = int(
+                    sps * (num_updates / update_every) * args.batch_size * env.num_envs
+                )
+                self.writer.add_scalar("charts/samples_per_sec", samples_per_sec, self.global_step)
+                # Perf/total_fps: transitions/sec (matches old LoggingHelper convention for
+                # direct comparison against Speed-Test / Speed-Test-Current runs).
+                total_fps = int(sps * env.num_envs)
+                self.writer.add_scalar("Perf/total_fps", total_fps, self.global_step)
+
+                # Same floor as success_rate below. These deques (maxlen 1000) start empty on every
+                # resume, so without it the first points average over a handful of episodes and swing
+                # wildly -- and at low env counts a window may hold a single episode.
+                if len(rewbuffer) >= MIN_EPISODES_TO_LOG:
+                    self.writer.add_scalar("charts/episodic_return", statistics.mean(rewbuffer), self.global_step)
+                    self.writer.add_scalar("charts/episodic_length", statistics.mean(lenbuffer), self.global_step)
+                
+                # Require a minimum sample before reporting a ratio. Counters deliberately carry over
+                # when the threshold is not met, so the value is always over >= this many episodes.
+                # Without it, windows holding a handful of episodes quantise hard: the first window
+                # cannot contain a timeout (episodes are longer than logging_interval), so it holds
+                # only early crashes and reads 0.00, while a 1-episode window reads 0.00 or 1.00.
+                if num_episodes_log >= MIN_EPISODES_TO_LOG:
+                    self.writer.add_scalar(
+                        "charts/success_rate", num_success_episodes_log / num_episodes_log, self.global_step
+                    )
                     num_success_episodes_log = 0
                     num_episodes_log = 0
 
-                    self.writer.add_scalar("charts/num_episodes", total_episodes, self.global_step)
+                self.writer.add_scalar("charts/num_episodes", total_episodes, self.global_step)
 
-                    if self.config.use_autotune:
-                        self.writer.add_scalar("losses/alpha_loss", alpha_loss.item(), self.global_step)
-                if args.save_interval > 0 and self.global_step > 0 and self.global_step % args.save_interval == 0:
-                    if self.is_main_process:
-                        logger.info(f"Saving model at global step {self.global_step}")
-                        self.save(os.path.join(self.log_dir, f"model_{self.global_step:07d}.pt"))
-                if args.save_replay_buffer_interval > 0 and self.global_step > 0 and self.global_step % args.save_replay_buffer_interval == 0:
-                    if self.is_main_process:
-                        rb_path = os.path.join(self.log_dir, f"replay_buffer_{self.global_step:07d}.pt")
-                        logger.info(f"Saving replay buffer at global step {self.global_step}")
-                        self.save_replay_buffer(rb_path)
-                        # self.export(onnx_file_path=os.path.join(self.log_dir, f"model_{self.global_step:07d}.onnx"))
+                for key, value in curriculum_log.items():
+                    self.writer.add_scalar(key, value, self.global_step)
+            if args.save_interval > 0 and self.global_step > 0 and self.global_step % args.save_interval == 0:
+                if self.is_main_process:
+                    logger.info(f"Saving model at global step {self.global_step}")
+                    self.save(os.path.join(self.log_dir, f"model_{self.global_step:07d}.pt"))
+            if args.save_replay_buffer_interval > 0 and self.global_step > 0 and self.global_step % args.save_replay_buffer_interval == 0:
+                if self.is_main_process:
+                    rb_path = os.path.join(self.log_dir, f"replay_buffer_{self.global_step:07d}.pt")
+                    logger.info(f"Saving replay buffer at global step {self.global_step}")
+                    self.save_replay_buffer(rb_path)
+                    # self.export(onnx_file_path=os.path.join(self.log_dir, f"model_{self.global_step:07d}.onnx"))
 
             # Avoid global_step being incremented beyond args.num_learning_iterations, so that the final checkpoint is
             # saved at exactly args.num_learning_iterations. In the `while` condition, we check for self.global_step <=

@@ -233,6 +233,15 @@ class FastSACConfig:
     target_entropy_ratio: float = 0.0
     """the ratio of the target entropy to the number of actions"""
 
+    handle_truncations: bool = False
+    """bootstrap the Q-target on time-limit truncations instead of treating them as terminals.
+
+    False (default) zero-bootstraps every done, so a timeout trains as a true terminal. That is only
+    self-consistent when the critic can observe time remaining; otherwise the value function is
+    asked to predict a drop to zero it cannot see coming. Set True for tasks whose critic has no
+    ``time_left`` observation. Left False by default so existing runs keep their current targets.
+    """
+
     num_atoms: int = 101
     """the number of atoms"""
 
@@ -296,6 +305,19 @@ class FastSACConfig:
     save_replay_buffer_interval: int = 0
     """save the online replay buffer every N global steps. 0 = disabled."""
 
+    load_replay_buffer_path: str = ""
+    """path to a .pt saved by save_replay_buffer, loaded into the online buffer at setup. "" = disabled."""
+
+    num_collect_envs: int = 0
+
+    no_learning: bool = False
+    """freeze actor, critic, target critic and alpha for the whole run (all optimizer lrs and
+    tau forced to 0 after checkpoint load). Diagnostics still log; only updates are suppressed."""
+
+    """how many of the envs feed the replay buffer. 0 = all. The remainder still step and still count
+    toward the logged episode statistics, they just contribute no training data -- which buys a usable
+    success rate at small collect counts for ~17% throughput."""
+
     logging_interval: int = 100
     """the interval to log the metrics"""
 
@@ -308,6 +330,8 @@ class FastSACConfig:
     use_cnn_encoder: bool = False
     """whether to use CNN for the encoder"""
 
+    use_pc_encoder: bool = False
+    
     actor_obs_keys: List[str] = field(default_factory=lambda: ["actor_obs"])
     critic_obs_keys: List[str] = field(default_factory=lambda: ["critic_obs"])
 

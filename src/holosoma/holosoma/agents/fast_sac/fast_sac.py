@@ -4,6 +4,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from rsl_rl.networks import MLP
+
 
 class Actor(nn.Module):
     def __init__(
@@ -153,6 +155,56 @@ class Actor(nn.Module):
             ],
             -1,
         )
+
+
+class PCActor(Actor):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def setup_network(self) -> None:
+        """Setup point cloud encoder and network with correct input dimensions."""
+        if self.encoder_obs_shape is None:
+            raise ValueError("encoder_obs_shape must be provided for CNNActor")
+
+        # Create the CNN encoder
+        output_dim = 32
+        self.encoder = MLP(
+            self.encoder_obs_shape[-1],
+            output_dim,
+            [256, 128],
+            "elu"
+        ).to(self.device)
+
+        # Calculate total input dimension: CNN features + state observations
+        state_obs_dim = sum(self.obs_indices[obs_key]["size"] for obs_key in self.obs_keys)
+        total_input_dim = output_dim + state_obs_dim
+
+        # Setup the main network with the correct input dimension
+        self._setup_network_with_input_dim(total_input_dim)
+
+    def process_obs(self, obs: torch.Tensor) -> torch.Tensor:
+        if self.encoder_obs_key is None or self.encoder_obs_shape is None:
+            raise ValueError("encoder_obs_key and encoder_obs_shape must be provided for CNNActor")
+
+        # Handle encoder observation
+        encoder_obs = torch.cat(
+            [obs[..., self.obs_indices[self.encoder_obs_key]["start"] : self.obs_indices[self.encoder_obs_key]["end"]]],
+            -1,
+        )
+        encoder_obs = encoder_obs.view(encoder_obs.shape[0], *self.encoder_obs_shape)
+        encoder_x = self.encoder(encoder_obs)
+
+        # Handle state observations. This could include encoder obs if the user wants
+        state_x = torch.cat(
+            [
+                obs[..., self.obs_indices[obs_key]["start"] : self.obs_indices[obs_key]["end"]]
+                for obs_key in self.obs_keys
+            ],
+            -1,
+        )
+
+        # Concatenate CNN features with state observations
+        return torch.cat([encoder_x, state_x], -1)
 
 
 class CNNActor(Actor):
@@ -391,6 +443,54 @@ class Critic(nn.Module):
             ],
             -1,
         )
+
+class PCCritic(Critic):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def setup_qnetworks(self) -> None:
+        """Setup CNN encoder and Q-networks with correct input dimensions."""
+        if self.encoder_obs_shape is None:
+            raise ValueError("encoder_obs_shape must be provided for CNNCritic")
+
+        # Create the CNN encoder
+        output_dim = 32
+        self.encoder = MLP(
+            self.encoder_obs_shape[-1],
+            output_dim,
+            [256, 128],
+            "elu"
+        ).to(self.device)
+
+        # Calculate total input dimension: CNN features + state observations
+        state_obs_dim = sum(self.obs_indices[obs_key]["size"] for obs_key in self.obs_keys)
+        total_obs_dim = output_dim + state_obs_dim
+
+        # Setup Q-networks with the correct observation dimension
+        self._setup_qnetworks_with_obs_dim(total_obs_dim)
+
+    def process_obs(self, obs: torch.Tensor) -> torch.Tensor:
+        if self.encoder_obs_key is None or self.encoder_obs_shape is None:
+            raise ValueError("encoder_obs_key and encoder_obs_shape must be provided for CNNCritic")
+
+        encoder_obs = torch.cat(
+            [obs[..., self.obs_indices[self.encoder_obs_key]["start"] : self.obs_indices[self.encoder_obs_key]["end"]]],
+            -1,
+        )
+        encoder_obs = encoder_obs.view(encoder_obs.shape[0], *self.encoder_obs_shape)
+        encoder_x = self.encoder(encoder_obs)
+
+        # Handle state observations. This could include encoder obs if the user wants
+        state_x = torch.cat(
+            [
+                obs[..., self.obs_indices[obs_key]["start"] : self.obs_indices[obs_key]["end"]]
+                for obs_key in self.obs_keys
+            ],
+            -1,
+        )
+
+        # Concatenate CNN features with state observations
+        return torch.cat([encoder_x, state_x], -1)
 
 
 class CNNCritic(Critic):

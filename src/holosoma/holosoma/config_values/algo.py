@@ -96,6 +96,7 @@ fast_sac = FastSACAlgoConfig(
         encoder_obs_key="perception_obs",
         encoder_obs_shape=(1, 13, 9),
         use_cnn_encoder=False,
+        use_pc_encoder=False,
         actor_obs_keys=["actor_obs"],
         critic_obs_keys=["critic_obs"],
     ),
