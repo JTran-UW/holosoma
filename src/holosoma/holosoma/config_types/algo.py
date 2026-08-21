@@ -314,6 +314,10 @@ class FastSACConfig:
     """freeze actor, critic, target critic and alpha for the whole run (all optimizer lrs and
     tau forced to 0 after checkpoint load). Diagnostics still log; only updates are suppressed."""
 
+    reset_optimizers: bool = False
+    """on resume, do NOT restore optimizer state from the checkpoint: Adam moments start at
+    zero and the learning rates come from config. Weights/normalizers are still loaded."""
+
     """how many of the envs feed the replay buffer. 0 = all. The remainder still step and still count
     toward the logged episode statistics, they just contribute no training data -- which buys a usable
     success rate at small collect counts for ~17% throughput."""

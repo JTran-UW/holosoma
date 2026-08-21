@@ -900,10 +900,38 @@ class FastSACAgent(BaseAlgo):
         self.critic_obs_normalizer.load_state_dict(torch_checkpoint["critic_obs_normalizer_state"])
         self.qnet_target.load_state_dict(torch_checkpoint["qnet_target_state_dict"])
         self.log_alpha.data.copy_(torch_checkpoint["log_alpha"].to(self.device))
-        self.actor_optimizer.load_state_dict(torch_checkpoint["actor_optimizer_state_dict"])
-        self.q_optimizer.load_state_dict(torch_checkpoint["q_optimizer_state_dict"])
-        self.alpha_optimizer.load_state_dict(torch_checkpoint["alpha_optimizer_state_dict"])
-        self.scaler.load_state_dict(torch_checkpoint["grad_scaler_state_dict"])
+        if self.config.reset_optimizers:
+            # Skip the optimizer restore entirely: Adam exp_avg/exp_avg_sq start at zero, so the
+            # effective step size is not inherited from the source run's gradient scale. Networks and
+            # normalizers are still loaded above.
+            logger.info(
+                "reset_optimizers=True: optimizer + grad-scaler state NOT restored from checkpoint "
+                "(Adam moments start from zero)"
+            )
+        else:
+            self.actor_optimizer.load_state_dict(torch_checkpoint["actor_optimizer_state_dict"])
+            self.q_optimizer.load_state_dict(torch_checkpoint["q_optimizer_state_dict"])
+            self.alpha_optimizer.load_state_dict(torch_checkpoint["alpha_optimizer_state_dict"])
+            self.scaler.load_state_dict(torch_checkpoint["grad_scaler_state_dict"])
+        # Re-apply optimizer hyperparameters from config. Optimizer.load_state_dict replaces
+        # param_groups wholesale, and lr/weight_decay live there -- so without this every resumed run
+        # silently inherits the CHECKPOINT's learning rates and ignores agent.*_learning_rate.
+        # weight_decay is only re-applied to the actor/critic optimizers, which are the ones
+        # constructed with args.weight_decay (alpha_optimizer uses the AdamW default).
+        for opt, lr, wd in (
+            (self.actor_optimizer, self.config.actor_learning_rate, self.config.weight_decay),
+            (self.q_optimizer, self.config.critic_learning_rate, self.config.weight_decay),
+            (self.alpha_optimizer, self.config.alpha_learning_rate, None),
+        ):
+            for g in opt.param_groups:
+                g["lr"] = lr
+                if wd is not None and "weight_decay" in g:
+                    g["weight_decay"] = wd
+        logger.info(
+            f"Optimizer hyperparameters re-applied from config: "
+            f"critic_lr={self.config.critic_learning_rate}, actor_lr={self.config.actor_learning_rate}, "
+            f"alpha_lr={self.config.alpha_learning_rate}, weight_decay={self.config.weight_decay}"
+        )
         self.global_step = torch_checkpoint["global_step"]
         self._restore_env_state(torch_checkpoint.get("env_state"))
 
