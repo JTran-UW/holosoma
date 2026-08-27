@@ -190,8 +190,10 @@ class FastSACAgent(BaseAlgo):
         self.expert_ratio_anneal_steps: int = 0  # 0 = no annealing
         self.rb_device = "cpu" if use_cpu_rb else self.device
 
-    def enable_sgft(self, shape_rewards: bool = True, h_step_backup: bool = False) -> None:
-        """Freeze the live actor/critic as a source value function for reward shaping.
+    def enable_sgft(
+        self, shape_rewards: bool = True, h_step_backup: bool = False, ckpt_path: str | None = None
+    ) -> None:
+        """Freeze a source value function for reward shaping.
 
         SGFT replaces each stored reward with
 
@@ -201,19 +203,29 @@ class FastSACAgent(BaseAlgo):
         shaping, so the optimal policy is unchanged -- it only redistributes credit toward
         states the source policy already valued.
 
-        MUST be called after load(): it snapshots whatever weights are live at the time. The
-        observation normalizers are snapshotted too, because they keep updating during training
-        and a frozen network behind a live normalizer would not be a fixed function of s.
+        If `ckpt_path` is given, the source actor/critic/normalizers are loaded from that
+        checkpoint (same format as save()/load()), so the shaping source can differ from the
+        weights being trained. Otherwise it snapshots whatever weights are live at the time,
+        so it MUST be called after load(). The observation normalizers are frozen too, because
+        the live ones keep updating during training and a frozen network behind a live
+        normalizer would not be a fixed function of s.
         """
         self._sgft_actor = copy.deepcopy(self.actor).eval().requires_grad_(False)
         self._sgft_qnet = copy.deepcopy(self.qnet).eval().requires_grad_(False)
         self._sgft_obs_norm = copy.deepcopy(self.obs_normalizer).eval().requires_grad_(False)
         self._sgft_critic_obs_norm = copy.deepcopy(self.critic_obs_normalizer).eval().requires_grad_(False)
+        if ckpt_path is not None:
+            ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=False)
+            self._sgft_actor.load_state_dict(ckpt["actor_state_dict"])
+            self._sgft_qnet.load_state_dict(ckpt["qnet_state_dict"])
+            self._sgft_obs_norm.load_state_dict(ckpt["obs_normalizer_state"])
+            self._sgft_critic_obs_norm.load_state_dict(ckpt["critic_obs_normalizer_state"])
         self.sgft_enabled = True
         self.sgft_shaping = shape_rewards
         self.h_step_backup = h_step_backup
+        source = f"checkpoint {ckpt_path}" if ckpt_path is not None else "the live (loaded) weights"
         logger.info(
-            f"SGFT source frozen from the loaded checkpoint | reward shaping={shape_rewards} | "
+            f"SGFT source frozen from {source} | reward shaping={shape_rewards} | "
             f"h-step backup={h_step_backup}"
         )
         if shape_rewards and h_step_backup:
