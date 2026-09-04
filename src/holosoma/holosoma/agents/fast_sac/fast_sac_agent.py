@@ -187,13 +187,26 @@ class FastSACAgent(BaseAlgo):
         self.lambda_bc_policy = lambda_bc_policy
         self.lambda_bc_critic = lambda_bc_critic
         self.expert_ratio: float = 0.5
+        self.expert_ratio_final: float = 0.0
         self.expert_ratio_anneal_steps: int = 0  # 0 = no annealing
+        # Global step the anneal is measured from. None = anchored to the step learn() starts at,
+        # so a resumed run anneals over its own steps rather than the absolute counter.
+        self.expert_ratio_anneal_start: int | None = None
         self.rb_device = "cpu" if use_cpu_rb else self.device
 
     def enable_sgft(
-        self, shape_rewards: bool = True, h_step_backup: bool = False, ckpt_path: str | None = None
+        self,
+        shape_rewards: bool = True,
+        h_step_backup: bool = False,
+        ckpt_path: str | None = None,
+        h_step: int = 0,
     ) -> None:
         """Freeze a source value function for reward shaping.
+
+        `h_step=H > 0` is full SGFT: potential-based shaping (forced on) PLUS an H-step critic
+        objective with NO Bellman backup -- the target is the H-step sum of shaped rewards
+        alone, so gamma^k * Phi(s_{t+k}) - Phi(s_t) inside that sum is the only long-horizon
+        signal. H must equal config.num_steps (the replay buffers' n-step window).
 
         SGFT replaces each stored reward with
 
@@ -214,19 +227,42 @@ class FastSACAgent(BaseAlgo):
         self._sgft_qnet = copy.deepcopy(self.qnet).eval().requires_grad_(False)
         self._sgft_obs_norm = copy.deepcopy(self.obs_normalizer).eval().requires_grad_(False)
         self._sgft_critic_obs_norm = copy.deepcopy(self.critic_obs_normalizer).eval().requires_grad_(False)
+        # The source critic is a SAC (soft) Q, so bootstrapping on it needs the SOURCE temperature,
+        # not the live one that keeps adapting.
+        self._sgft_log_alpha = self.log_alpha.detach().clone()
         if ckpt_path is not None:
             ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=False)
             self._sgft_actor.load_state_dict(ckpt["actor_state_dict"])
             self._sgft_qnet.load_state_dict(ckpt["qnet_state_dict"])
             self._sgft_obs_norm.load_state_dict(ckpt["obs_normalizer_state"])
             self._sgft_critic_obs_norm.load_state_dict(ckpt["critic_obs_normalizer_state"])
+            if "log_alpha" in ckpt:
+                self._sgft_log_alpha = torch.as_tensor(ckpt["log_alpha"], device=self.device).detach().clone().reshape(-1)
+            else:
+                logger.warning(
+                    "SGFT source checkpoint has no 'log_alpha'; using the live temperature as the source "
+                    "temperature (only matters for h_step_backup)."
+                )
+        if h_step < 0:
+            raise ValueError(f"h_step must be >= 0, got {h_step}")
+        if h_step > 0:
+            if h_step_backup:
+                raise ValueError("SGFT h_step (no Bellman backup) and h_step_backup (bootstrap off V_source) are mutually exclusive")
+            if h_step != self.config.num_steps:
+                raise ValueError(
+                    f"SGFT h_step={h_step} must equal config.num_steps={self.config.num_steps}: the replay "
+                    "buffers build their n-step sums with num_steps, so H has to be the same window"
+                )
+            shape_rewards = True
         self.sgft_enabled = True
         self.sgft_shaping = shape_rewards
         self.h_step_backup = h_step_backup
+        self.sgft_h_step = h_step
         source = f"checkpoint {ckpt_path}" if ckpt_path is not None else "the live (loaded) weights"
         logger.info(
             f"SGFT source frozen from {source} | reward shaping={shape_rewards} | "
-            f"h-step backup={h_step_backup}"
+            f"h-step backup={h_step_backup} | H-step no-backup={h_step or 'off'} | "
+            f"alpha_source={self._sgft_log_alpha.exp().item():.4g}"
         )
         if shape_rewards and h_step_backup:
             logger.warning(
@@ -250,6 +286,25 @@ class FastSACAgent(BaseAlgo):
             return x_norm
         raw = x_norm * (live._std + live.eps) + live._mean
         return (raw - src._mean) / (src._std + src.eps)
+
+    @torch.no_grad()
+    def _sgft_backup_target(self, next_obs_live, next_critic_obs_live, rewards, bootstrap, discount):
+        """n-step target distribution bootstrapped on the FROZEN source's SOFT state value.
+
+        The source critic is a SAC Q, so its soft value at s' is E_{a'~pi_src}[Q_src(s',a') -
+        alpha_src * log pi_src(a'|s')]: sample a' from the frozen actor and shift the return by the
+        source entropy term at the source temperature. Inputs are batches normalized by the LIVE
+        normalizers; they are re-expressed in the frozen source's frame first. Shape: [num_critics,
+        batch, num_atoms] through the categorical Bellman projection of the source critic.
+        """
+        src_next_obs = self._renorm_to_source(next_obs_live, self.obs_normalizer, self._sgft_obs_norm)
+        src_next_critic_obs = self._renorm_to_source(
+            next_critic_obs_live, self.critic_obs_normalizer, self._sgft_critic_obs_norm
+        )
+        src_actions, src_log_probs = self._sgft_actor.get_actions_and_log_probs(src_next_obs)
+        alpha_src = self._sgft_log_alpha.exp()
+        shifted = rewards - discount * bootstrap * alpha_src * src_log_probs
+        return self._sgft_qnet.projection(src_next_critic_obs, src_actions, shifted, bootstrap, discount)
 
     @torch.no_grad()
     def sgft_value(self, actor_obs: torch.Tensor, critic_obs: torch.Tensor) -> torch.Tensor:
@@ -310,9 +365,16 @@ class FastSACAgent(BaseAlgo):
 
     @property
     def _current_expert_ratio(self) -> float:
+        """Expert share of each batch: linear from expert_ratio to expert_ratio_final over
+        expert_ratio_anneal_steps global steps, starting at expert_ratio_anneal_start; constant
+        before the start and clamped at the final value after the window."""
         if self.expert_ratio_anneal_steps <= 0:
             return self.expert_ratio
-        return self.expert_ratio * max(0.0, 1.0 - self.global_step / self.expert_ratio_anneal_steps)
+        if self.expert_ratio_anneal_start is None:
+            self.expert_ratio_anneal_start = self.global_step
+        frac = (self.global_step - self.expert_ratio_anneal_start) / self.expert_ratio_anneal_steps
+        frac = min(max(frac, 0.0), 1.0)
+        return self.expert_ratio + (self.expert_ratio_final - self.expert_ratio) * frac
 
     def setup(self) -> None:
         logger.info("Setting up FastSAC")
@@ -511,10 +573,12 @@ class FastSACAgent(BaseAlgo):
         self.sgft_enabled: bool = False      # source frozen and available
         self.sgft_shaping: bool = False      # rewrite stored rewards as r + gamma*V(s') - V(s)
         self.h_step_backup: bool = False     # bootstrap the n-step target off V_source, not Q_target
+        self.sgft_h_step: int = 0            # >0: critic target = H-step shaped sum, no bootstrap at all
         self._sgft_actor: nn.Module | None = None
         self._sgft_qnet: nn.Module | None = None
         self._sgft_obs_norm: nn.Module | None = None
         self._sgft_critic_obs_norm: nn.Module | None = None
+        self._sgft_log_alpha: torch.Tensor | None = None   # frozen source temperature (log alpha)
 
         if args.use_symmetry:
             # using env._env is not really ideal..
@@ -570,6 +634,21 @@ class FastSACAgent(BaseAlgo):
                 p.grad.copy_(flat[offset : offset + n].view_as(p.grad))
                 offset += n
 
+    def _bootstrap_mask(self, dones: torch.Tensor, truncations: torch.Tensor) -> torch.Tensor:
+        """Per-sample weight on the bootstrapped tail of the critic target.
+
+        Default: 1 except on real terminations (with handle_truncations the target bootstraps
+        through a truncation; without it, timeouts are treated as terminals too). Under H-step
+        SGFT (sgft_h_step > 0) it is 0 everywhere: the target is the H-step shaped sum alone,
+        which through the categorical projection is a point mass at that sum. The entropy
+        bonus is attached to the same mask, so it vanishes with the bootstrap.
+        """
+        if self.sgft_h_step > 0:
+            return torch.zeros_like(dones, dtype=torch.float)
+        if self.config.handle_truncations:
+            return (truncations | ~dones).float()
+        return (~dones).float()
+
     def _update_main(
         self, data: TensorDict
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -596,35 +675,19 @@ class FastSACAgent(BaseAlgo):
             # the target bootstraps through a truncation and only real terminations zero it; the
             # rollout already stores the pre-reset final observation for those steps, so the
             # bootstrapped value is taken at the correct state.
-            if args.handle_truncations:
-                bootstrap = (truncations | ~dones).float()
-            else:
-                bootstrap = (~dones).float()
+            bootstrap = self._bootstrap_mask(dones, truncations)
 
             with torch.no_grad():
                 next_state_actions, next_state_log_probs = actor.get_actions_and_log_probs(next_observations)
                 discount = args.gamma ** data["next"]["effective_n_steps"]
 
                 if self.h_step_backup:
-                    # h-step backup: the n-step return bootstraps off the FROZEN source critic
-                    # instead of the learned target critic. The source is distributional, so its
-                    # atom distribution goes through the same categorical Bellman projection --
-                    # collapsing it to a scalar point mass would discard the return distribution
-                    # the C51 cross-entropy is regressing against.
-                    #
-                    # The entropy bonus is deliberately dropped here: V_source is a hard value
-                    # function carrying no entropy term, so subtracting alpha*log_pi from a target
-                    # built on it would mix two different value definitions.
-                    src_next_obs = self._renorm_to_source(
-                        next_observations, self.obs_normalizer, self._sgft_obs_norm
-                    )
-                    src_next_critic_obs = self._renorm_to_source(
-                        next_critic_observations, self.critic_obs_normalizer, self._sgft_critic_obs_norm
-                    )
-                    src_actions = self._sgft_actor(src_next_obs)[0]  # deterministic source action
+                    # h-step backup: the n-step return bootstraps off the FROZEN source critic's
+                    # SOFT value (sampled source action, source entropy term at the source
+                    # temperature) instead of the learned target critic. See _sgft_backup_target.
                     target_net = self._sgft_qnet
-                    target_distributions = target_net.projection(
-                        src_next_critic_obs, src_actions, rewards, bootstrap, discount,
+                    target_distributions = self._sgft_backup_target(
+                        next_observations, next_critic_observations, rewards, bootstrap, discount,
                     )
                 else:
                     target_net = qnet_target
@@ -798,11 +861,13 @@ class FastSACAgent(BaseAlgo):
         # Sample a large batch (batch_size * num_updates)
         large_batch_size = batch_size * num_updates
 
-        if self.expert_rb is not None:
+        expert_ratio = self._current_expert_ratio if self.expert_rb is not None else 0.0
+        if self.expert_rb is not None and expert_ratio > 0.0:
             # Mix expert/online per update using self.expert_ratio (linearly annealed if configured).
             # Expert rb may have a different n_env from the online env, so we
             # compute a per-env count that lands at ~expert_ratio of total samples.
-            main_per_env = max(round(batch_size * (1.0 - self._current_expert_ratio)), 1)
+            # A ratio that has annealed to exactly 0 takes the online-only branch below.
+            main_per_env = max(round(batch_size * (1.0 - expert_ratio)), 1)
             target_expert_total_per_update = (batch_size - main_per_env) * self.rb.n_env
             expert_per_env = max(target_expert_total_per_update // self.expert_rb.n_env, 1)
 
@@ -1107,6 +1172,8 @@ class FastSACAgent(BaseAlgo):
         actor_grad_norm = torch.tensor(0.0, device=device)
         bc_policy_loss = torch.tensor(0.0, device=device)
         pbar = tqdm.tqdm(total=args.num_learning_iterations, initial=self.global_step)
+        if self.expert_ratio_anneal_start is None:
+            self.expert_ratio_anneal_start = self.global_step
     
         # Resolve the update schedule once: `num_updates` gradient steps every `update_every` env
         # steps. These are independent knobs -- num_updates alone could only express "N per step"
@@ -1295,6 +1362,8 @@ class FastSACAgent(BaseAlgo):
                     self.writer.add_scalar(_k, _v, self.global_step)
                 sps = self.global_step / (time.time() - start_time)
                 self.writer.add_scalar("charts/SPS", int(sps), self.global_step)
+                if self.expert_rb is not None:
+                    self.writer.add_scalar("charts/expert_ratio", self._current_expert_ratio, self.global_step)
                 # Use the realized replay ratio, not args.num_updates: with update_interval>1
                 # the round only fires every update_every steps, so args.num_updates alone
                 # overstates throughput by exactly that factor.
